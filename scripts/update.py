@@ -26,93 +26,59 @@ def main() -> None:
     if not os.path.isfile(pkg_json):
         subprocess.run(["npm", "init", "-y"], cwd=_PLUGINS_DIR, check=True, capture_output=True, timeout=30)
 
-    get_reg = subprocess.run(
+    # 使用 --registry 指定源：项目目录 .npmrc 会覆盖用户级 npm config，原先 set registry 常不生效
+    eff = subprocess.run(
         ["npm", "config", "get", "registry"],
+        cwd=_PLUGINS_DIR,
         capture_output=True,
         text=True,
         timeout=10,
     )
-    saved_registry = (get_reg.stdout or "").strip()
-    print(f"[更新] 安装前 npm 源（将暂时切国内源并在结束后恢复）: {saved_registry or '(默认)'}", flush=True)
-    try:
-        subprocess.run(
-            ["npm", "config", "set", "registry", _NPM_REGISTRY_CN],
-            check=True,
-            capture_output=True,
-            timeout=10,
-        )
-        print(f"[更新] 已切换为国内源 {_NPM_REGISTRY_CN}。", flush=True)
-    except Exception as e:
-        print(f"[更新] 切换国内源失败，将用当前源首次尝试: {e}", flush=True)
+    print(
+        f"[更新] plugins 目录解析到的 registry（仅供参考，本次使用 --registry 覆盖）: "
+        f"{(eff.stdout or '').strip() or '(默认)'}",
+        flush=True,
+    )
 
-    def _run_npm_install() -> subprocess.CompletedProcess:
+    def _run_npm_install(registry: str) -> subprocess.CompletedProcess:
         return subprocess.run(
-            ["npm", "install", "openclaw-memory-alibaba-mysql"],
+            [
+                "npm",
+                "install",
+                "openclaw-memory-alibaba-mysql",
+                "--registry",
+                registry,
+            ],
             cwd=_PLUGINS_DIR,
             capture_output=True,
             text=True,
             timeout=120,
         )
 
-    print("[更新] 执行 npm install openclaw-memory-alibaba-mysql...", flush=True)
+    print(f"[更新] 执行 npm install（优先 {_NPM_REGISTRY_CN}）...", flush=True)
     result: Optional[subprocess.CompletedProcess] = None
     try:
+        result = _run_npm_install(_NPM_REGISTRY_CN)
+    except subprocess.TimeoutExpired:
+        print("[更新] 国内源 npm install 超时，改试官方源。", flush=True)
         try:
-            result = _run_npm_install()
+            result = _run_npm_install(_NPM_REGISTRY_OFFICIAL)
         except subprocess.TimeoutExpired:
-            print("[更新] 国内/当前源 npm install 超时，改试官方源。", flush=True)
-            try:
-                subprocess.run(
-                    ["npm", "config", "set", "registry", _NPM_REGISTRY_OFFICIAL],
-                    check=True,
-                    capture_output=True,
-                    timeout=10,
-                )
-            except Exception as ex:
-                print(f"[更新] 切换官方源失败: {ex}", file=sys.stderr, flush=True)
-                sys.exit(1)
-            result = _run_npm_install()
-        else:
-            if result.returncode != 0:
-                print("[更新] 国内/当前源 npm install 失败，改试官方源。", flush=True)
-                try:
-                    subprocess.run(
-                        ["npm", "config", "set", "registry", _NPM_REGISTRY_OFFICIAL],
-                        check=True,
-                        capture_output=True,
-                        timeout=10,
-                    )
-                except Exception as ex:
-                    print(f"[更新] 切换官方源失败: {ex}", file=sys.stderr, flush=True)
-                    sys.exit(1)
-                result = _run_npm_install()
-
-        assert result is not None
-        if result.returncode != 0:
-            print(f"npm install 失败: {result.stderr or result.stdout}", file=sys.stderr, flush=True)
+            print("[更新] 官方源 npm install 仍超时。", file=sys.stderr, flush=True)
             sys.exit(1)
-    finally:
-        if saved_registry:
+    else:
+        if result.returncode != 0:
+            print("[更新] 国内源 npm install 失败，改试官方源。", flush=True)
             try:
-                subprocess.run(
-                    ["npm", "config", "set", "registry", saved_registry],
-                    check=True,
-                    capture_output=True,
-                    timeout=10,
-                )
-                print(f"[更新] 已恢复 npm 源为 {saved_registry}。", flush=True)
-            except Exception:
-                pass
-        else:
-            try:
-                subprocess.run(
-                    ["npm", "config", "delete", "registry"],
-                    check=True,
-                    capture_output=True,
-                    timeout=10,
-                )
-            except Exception:
-                pass
+                result = _run_npm_install(_NPM_REGISTRY_OFFICIAL)
+            except subprocess.TimeoutExpired:
+                print("[更新] 官方源 npm install 超时。", file=sys.stderr, flush=True)
+                sys.exit(1)
+
+    assert result is not None
+    if result.returncode != 0:
+        print(f"npm install 失败: {result.stderr or result.stdout}", file=sys.stderr, flush=True)
+        sys.exit(1)
 
     plugin_path = os.path.abspath(os.path.join(_PLUGINS_DIR, "node_modules", "openclaw-memory-alibaba-mysql"))
     if not os.path.isdir(plugin_path):

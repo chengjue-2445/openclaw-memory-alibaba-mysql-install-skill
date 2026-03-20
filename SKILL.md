@@ -1,6 +1,6 @@
 ---
 name: openclaw-memory-alibaba-mysql-install-skill
-description: 安装 OpenClaw 阿里云 RDS 记忆插件环境。脚本或 Agent 遇错均勿自行重试；须把完整输出给用户后再由用户决定。npm 失败后禁止手动 mkdir+npm 补装。每次执行 install.py/update.py 前须依赖检查。仅升级用 update.py。建议密钥 ~/.openclaw/.env；改后 gateway 重启。须用户同意；非交互必须 --yes。
+description: 安装 OpenClaw 阿里云 RDS 记忆插件环境。脚本或 Agent 遇错或者任意失败与超时均勿自行重试；须把完整输出给用户后再由用户决定。每次执行 install.py/update.py 前须依赖检查。仅升级用 update.py。建议密钥 ~/.openclaw/.env；改后 gateway 重启。须用户同意；非交互必须 --yes。
 keywords: openclaw, memory, rds, aliyun, mysql, install.py
 ---
 
@@ -32,7 +32,7 @@ keywords: openclaw, memory, rds, aliyun, mysql, install.py
 
 **禁止在 npm 失败/超时后「手动补装」（常见误操作）**
 
-- **`install.py` 在 npm 阶段报错、超时（如 `subprocess.TimeoutExpired`、120 秒）、或退出后**，**禁止**助手自行执行诸如 `mkdir -p ~/.openclaw/plugins && cd ~/.openclaw/plugins && npm install openclaw-memory-alibaba-mysql` 等命令来「代替脚本完成安装」。那会与脚本内的 **registry 切换/恢复、`openclaw.json` 合并、`plugins.allow` 策略**等**脱节**，易留下半套配置，且掩盖真实根因（网络、代理、磁盘、registry）。
+- **`install.py` 在 npm 阶段报错、超时（如 `subprocess.TimeoutExpired`、120 秒）、或退出后**，**禁止**助手自行执行诸如 `mkdir -p ~/.openclaw/plugins && cd ~/.openclaw/plugins && npm install openclaw-memory-alibaba-mysql` 等命令来「代替脚本完成安装」。那会与脚本内的 **`npm install --registry`（国内源失败/超时再试官方）、`openclaw.json` 合并、`plugins.allow` 策略**等**脱节**，易留下半套配置，且掩盖真实根因（网络、代理、磁盘、registry）。
 - **应做**：把 **完整 stderr/stdout 与退出原因**交给用户；可**说明**可能原因（npm 网络、代理、防火墙、磁盘等），但**不要**在用户未开口前**自动重跑脚本或重试安装**。待用户修好环境并**明确同意**再执行下一次 **`python3 scripts/install.py`** 或 **`python3 scripts/update.py`**（后者**仅**在确认只是升级包、**不应再创建 RDS** 时）——**不要**裸 `npm install` 当修复手段。
 - **半截状态**：若日志显示 **RDS 已创建成功**但后续步骤失败，**不要盲目**重跑完整 `install.py`（可能再次尝试购实例或进入未定义状态）。应先向用户说明现状，由用户结合控制台与脚本输出决定：例如仅修网络后是否只适跑 **`update.py`**、或需人工清理资源后再装——**此类分支以用户确认为准**，Skill 不替用户自动选「手动 npm」捷径。
 
