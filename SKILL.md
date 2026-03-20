@@ -37,7 +37,7 @@ keywords: openclaw, memory, rds, aliyun, mysql, 8.0, 向量, 安装
 - **正确**：在 OpenClaw 或 Agent 中配置本 Skill 时，将 **skill 根路径** 指向本项目的实际目录（例如克隆后的 `openclaw-memory-alibaba-mysql-install-skill` 所在路径），执行入口为 `python scripts/install.py`，且**当前工作目录**为该项目根目录。
 - **错误**：从 `node_modules/openclaw/skills/memory-alibaba-mysql-install/` 或类似路径解析本 Skill 会报「File not found」，因本 Skill 不在此处。
 
-若通过 OpenClaw 网关调用，请确保该 Skill 的注册配置中 **path / cwd** 指向本项目根目录，以便 `scripts/install.py` 能被正确找到并执行。
+若通过 OpenClaw 网关调用：请把本 Skill 放在**工作区**的 `skills` 目录下（例如 `~/.openclaw/workspace/skills/openclaw-memory-alibaba-mysql-install-skill`），或通过 `skills.load.extraDirs` 增加包含本项目的目录；**不要**在 `skills.entries.<name>` 里写 `path`（当前 OpenClaw 仅识别 `enabled` / `env` / `apiKey`）。执行安装时工作目录需为该 Skill 根目录（与 `python scripts/install.py` 一致）。
 
 ## 前置条件
 
