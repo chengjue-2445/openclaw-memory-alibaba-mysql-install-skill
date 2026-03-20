@@ -1,0 +1,34 @@
+# OpenClaw / ClawHub 用 skill 清单
+name: openclaw-memory-alibaba-mysql-install-skill
+version: "1.0.0"
+description: 一键安装阿里云 RDS MySQL 8.0 记忆插件环境（购买实例、开启向量、建库建账号、白名单、写入 ~/.bashrc 与 OpenClaw 配置目录 .env）。遇错即退出，不重试。
+author: OpenClaw Memory
+
+capabilities:
+  - 安装 ALIBABA RDS 记忆插件环境：购买 MySQL 8.0 实例、开启向量、创建数据库 openclaw_memory、创建账号与白名单、写入 ~/.bashrc 与配置目录 .env
+
+entry_points:
+  - type: cli
+    command: python scripts/install.py
+    description: 执行一键安装。可选传入购买参数 JSON 与 --yes，例 python scripts/install.py --yes '<JSON>'（需在 skill 根目录下运行，或指定脚本绝对路径）
+
+# 执行时建议（若平台支持）：无缓冲输出、定期轮询日志、流式转发
+# runtime:
+#   unbuffered: true
+#   logPollInterval: 5
+#   streamOutput: true
+
+requires:
+  bins: [python3]
+  env:
+    - ALIBABA_CLOUD_ACCESS_KEY_ID
+    - ALIBABA_CLOUD_ACCESS_KEY_SECRET
+    - DASHSCOPE_API_KEY
+  optional_env:
+    - ALIBABA_CLOUD_SECURITY_TOKEN
+    - OPENCLAW_RDS_REGION
+    - OPENCLAW_VPC_ID
+    - OPENCLAW_VSWITCH_ID
+    - OPENCLAW_ZONE_ID
+
+os: [darwin, linux]
