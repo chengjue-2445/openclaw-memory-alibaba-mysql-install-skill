@@ -6,6 +6,11 @@ keywords: openclaw, memory, rds, aliyun, mysql, install.py
 
 # OpenClaw Memory 阿里云 MySQL 安装 Skill
 
+## 硬性规则（Agent 必遵）
+
+- **禁止自行重试**：脚本失败、超时或异常退出后，**不得**在未获用户**明确指示**前再次执行、循环重试或改用手动命令代替。应**停止**，把完整 stdout/stderr 与退出码交给用户，由用户决定下一步。
+- **禁止 npm 失败后手动补装**：npm 阶段报错/超时后，**不得**自行执行 `mkdir`、`cd`、`npm install` 等命令代替脚本完成安装。
+
 ## 何时使用
 
 - 用户要**安装或准备 OpenClaw 的阿里云 RDS 记忆插件**（`openclaw-memory-alibaba-mysql`）所需环境时使用本 Skill；具体创建规格与步骤由 **`scripts/install.py`** 完成，接受可能产生的**云资源费用**即可。
