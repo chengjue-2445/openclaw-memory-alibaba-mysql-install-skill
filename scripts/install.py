@@ -19,7 +19,6 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
@@ -812,7 +811,7 @@ export MYSQL_DATABASE="openclaw_memory"
     subprocess.run([os.environ.get("SHELL", "bash"), "-c", f"source {bashrc}"], timeout=5, capture_output=True)
     print("[安装] 阶段：已执行 source ~/.bashrc。", flush=True)
 
-    # npm install openclaw-memory-alibaba-mysql 并解析安装路径（安装前切国内源以加速，安装后恢复原源）
+    # npm install：先切国内镜像，结束后恢复；超时或失败则改试 registry.npmjs.org 一次
     plugins_dir = os.path.expanduser("~/.openclaw/plugins")
     os.makedirs(plugins_dir, exist_ok=True)
     pkg_json = os.path.join(plugins_dir, "package.json")
@@ -820,51 +819,74 @@ export MYSQL_DATABASE="openclaw_memory"
         subprocess.run(["npm", "init", "-y"], cwd=plugins_dir, check=True, capture_output=True, timeout=30)
 
     npm_registry_cn = "https://registry.npmmirror.com"
-    saved_registry = None
-    try:
-        # 仅当系统时间为北京时间（UTC+8）且当前非国内源时，才临时切国内源
-        def _is_beijing_time() -> bool:
-            try:
-                # 本地时区相对 UTC 的偏移；北京时间 = UTC+8
-                ts = datetime.now(timezone.utc)
-                local = ts.astimezone()
-                offset = local.utcoffset()
-                return offset is not None and offset == timedelta(hours=8)
-            except Exception:
-                return False
+    npm_registry_official = "https://registry.npmjs.org"
 
-        get_reg = subprocess.run(
-            ["npm", "config", "get", "registry"],
+    get_reg = subprocess.run(
+        ["npm", "config", "get", "registry"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    saved_registry = (get_reg.stdout or "").strip()
+    print(
+        f"[安装] 阶段：安装前 npm 源（将暂时切国内源并在结束后恢复）: {saved_registry or '(默认)'}",
+        flush=True,
+    )
+    try:
+        subprocess.run(
+            ["npm", "config", "set", "registry", npm_registry_cn],
+            check=True,
             capture_output=True,
-            text=True,
             timeout=10,
         )
-        current = (get_reg.stdout or "").strip()
-        print(f"[安装] 阶段：当前 npm 源: {current or '(默认)'}", flush=True)
-        is_cn_registry = current and (npm_registry_cn in current or "npmmirror.com" in current)
-        if not is_cn_registry and _is_beijing_time():
-            saved_registry = current
-            subprocess.run(
-                ["npm", "config", "set", "registry", npm_registry_cn],
-                check=True,
-                capture_output=True,
-                timeout=10,
-            )
-            print(f"[安装] 阶段：检测到北京时间，已临时切换为国内源 {npm_registry_cn}，安装完成后将恢复。", flush=True)
-        elif not is_cn_registry:
-            print("[安装] 阶段：当前非北京时间，保持原 npm 源不变。", flush=True)
+        print(f"[安装] 阶段：已切换为国内源 {npm_registry_cn}。", flush=True)
     except Exception as e:
-        print(f"[安装] 阶段：读取/设置 npm 源时忽略: {e}", flush=True)
+        print(f"[安装] 阶段：切换国内源失败，将用当前源首次尝试: {e}", flush=True)
 
     print("[安装] 阶段：安装 npm 包 openclaw-memory-alibaba-mysql...", flush=True)
-    try:
-        result = subprocess.run(
+
+    def _run_npm_install() -> subprocess.CompletedProcess:
+        return subprocess.run(
             ["npm", "install", "openclaw-memory-alibaba-mysql"],
             cwd=plugins_dir,
             capture_output=True,
             text=True,
             timeout=120,
         )
+
+    result: Optional[subprocess.CompletedProcess] = None
+    try:
+        try:
+            result = _run_npm_install()
+        except subprocess.TimeoutExpired:
+            print("[安装] 阶段：国内/当前源 npm install 超时，改试官方源。", flush=True)
+            try:
+                subprocess.run(
+                    ["npm", "config", "set", "registry", npm_registry_official],
+                    check=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+            except Exception as ex:
+                print(f"[安装] 切换官方源失败: {ex}", file=sys.stderr, flush=True)
+                sys.exit(1)
+            result = _run_npm_install()
+        else:
+            if result.returncode != 0:
+                print("[安装] 阶段：国内/当前源 npm install 失败，改试官方源。", flush=True)
+                try:
+                    subprocess.run(
+                        ["npm", "config", "set", "registry", npm_registry_official],
+                        check=True,
+                        capture_output=True,
+                        timeout=10,
+                    )
+                except Exception as ex:
+                    print(f"[安装] 切换官方源失败: {ex}", file=sys.stderr, flush=True)
+                    sys.exit(1)
+                result = _run_npm_install()
+
+        assert result is not None
         if result.returncode != 0:
             print(f"npm install 失败: {result.stderr or result.stdout}", file=sys.stderr, flush=True)
             sys.exit(1)
@@ -878,6 +900,17 @@ export MYSQL_DATABASE="openclaw_memory"
                     timeout=10,
                 )
                 print(f"[安装] 阶段：已恢复 npm 源为 {saved_registry}。", flush=True)
+            except Exception as e:
+                print(f"[安装] 阶段：恢复 npm 源失败（请手动恢复）: {e}", file=sys.stderr, flush=True)
+        else:
+            try:
+                subprocess.run(
+                    ["npm", "config", "delete", "registry"],
+                    check=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+                print("[安装] 阶段：已恢复 npm 源为默认。", flush=True)
             except Exception as e:
                 print(f"[安装] 阶段：恢复 npm 源失败（请手动恢复）: {e}", file=sys.stderr, flush=True)
     plugin_path = os.path.abspath(os.path.join(plugins_dir, "node_modules", "openclaw-memory-alibaba-mysql"))
