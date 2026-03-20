@@ -1,6 +1,6 @@
 ---
 name: openclaw-memory-alibaba-mysql-transfer-skill
-description: 当用户说「迁移本地记忆到 RDS 记忆插件」等类似表述时，读取 OpenClaw 配置目录下 workspace/MEMORY.md，逐行调用 memory_store 写入向量库。执行前需校验 RDS 记忆插件已配置。
+description: 当用户说「迁移本地记忆到 RDS 记忆插件」等类似表述时，读取 OpenClaw 配置目录下 workspace/MEMORY.md，逐行调用 memory_store 写入向量库。执行前需校验 RDS 记忆插件已配置。导入完成后可运行 scripts/transfer.py 将 MEMORY.md 备份为 MEMORY.md.bak.{时间戳}。
 keywords: 迁移, 记忆, MEMORY.md, RDS, 导入, 本地记忆, 记忆迁移
 ---
 
@@ -35,6 +35,7 @@ keywords: 迁移, 记忆, MEMORY.md, RDS, 导入, 本地记忆, 记忆迁移
 ### 4. 解析与导入
 
 - 按行拆分文件内容，过滤空行（`trim` 后为空则忽略）
+- **并行处理**：可启动多个 subagent 并行调用 `memory_store` 以加速导入；**不得**同时运行超过 **5** 个 subagent。
 - 对每条非空行：
   - 调用 `memory_store`，参数：
     - `text`：该行内容（trim 后）
@@ -46,6 +47,12 @@ keywords: 迁移, 记忆, MEMORY.md, RDS, 导入, 本地记忆, 记忆迁移
 
 - 汇总成功导入条数
 - 若有失败，列出失败条及原因
+
+### 6. 备份 MEMORY.md（可选）
+
+- 导入完成后，可执行 **`python3 scripts/transfer.py`** 将 `workspace/MEMORY.md` 重命名为 `MEMORY.md.bak.{时间戳}`（格式 YYYYMMDDHHMMSS，如 `20250101143022`），便于保留已导入内容的副本。
+- 脚本通过 `openclaw config file | grep openclaw.json` 解析配置目录，解析失败时回退 `~/.openclaw`。
+- 若 `workspace/MEMORY.md` 不存在，脚本退出并报错。
 
 ## 边界æid>.tools.allow`（非空），则 `memory_store` 与 `read` 必须在该白名单中，否则无法调用。未配置 allow 时默认允许所有工具。示例（在 `openclaw.json` 中）：
   ```json

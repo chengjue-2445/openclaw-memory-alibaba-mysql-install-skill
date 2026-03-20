@@ -5,11 +5,16 @@ description: 从 workspace/MEMORY.md 迁移记忆到 RDS 向量库（Agent 驱�
 author: OpenClaw Memory
 
 capabilities:
-  - 读取 OpenClaw 配置目录下 workspace/MEMORY.md，逐行调用 memory_store 导入记忆到 RDS 向量库
+  - 读取 OpenClaw 配置目录下 workspace/MEMORY.md，逐行调用 memory_store 导入记忆到 RDS 向量库；可启动多个 subagent 并行处理，同时不超过 5 个
+  - scripts/transfer.py：将 workspace/MEMORY.md 重命名为 MEMORY.md.bak.{时间戳}（导入完成后可选）
 
-# 无 CLI 入口，纯 Agent 驱动；Agent 通过 SKILL.md 匹配用户意图后按步骤执行
+entry_points:
+  - type: cli
+    command: python3 scripts/transfer.py
+    description: 将配置目录下 workspace/MEMORY.md 重命名为 MEMORY.md.bak.{YYYYMMDDHHMMSS}，解析失败时回退 ~/.openclaw
+
 requires:
-  bins: []
+  bins: [python3]
 
 os: [darwin, linux]
 
