@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 将 plugins.load.paths 中已配置的 openclaw-memory-alibaba-mysql 插件目录内的文件更新到最新版本。
-仅执行 npm install openclaw-memory-alibaba-mysql，不修改 ~/.openclaw/openclaw.json 中的 path 配置。
+仅执行 npm install openclaw-memory-alibaba-mysql，不修改 OpenClaw 配置目录下 openclaw.json 中的 path 配置。
 """
 from __future__ import annotations
 

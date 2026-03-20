@@ -600,9 +600,9 @@ def _write_openclaw_dotenv(
     return env_path
 
 
-def _already_installed() -> bool:
-    """若 ~/.openclaw/openclaw.json 中已配置 slots.memory 为本插件，视为已安装。"""
-    path = os.path.join(os.path.expanduser("~/.openclaw"), "openclaw.json")
+def _already_installed(config_dir: str) -> bool:
+    """若 OpenClaw 配置目录内 openclaw.json 中已配置 slots.memory 为本插件，视为已安装。"""
+    path = os.path.join(config_dir, "openclaw.json")
     if not os.path.isfile(path):
         return False
     try:
@@ -634,7 +634,19 @@ def main() -> None:
     print("[安装] 开始安装 openclaw-memory-alibaba-mysql（阿里云 RDS + 插件注册）", flush=True)
     _check_python_version()
     print("[安装] 阶段：校验 Python 版本通过", flush=True)
-    if _already_installed():
+
+    config_dir = _get_openclaw_config_dir_from_cli()
+    if not config_dir:
+        config_dir = os.path.expanduser("~/.openclaw")
+        print(
+            "[安装] 未能通过 openclaw config file | grep openclaw.json 解析配置目录，"
+            f"回退使用 {config_dir}。",
+            flush=True,
+        )
+    else:
+        print(f"[安装] 阶段：OpenClaw 配置目录 {config_dir}", flush=True)
+
+    if _already_installed(config_dir):
         print("检测到已安装 openclaw-memory-alibaba-mysql（plugins.slots.memory 已配置）。是否更新 openclaw-memory-alibaba-mysql 插件？(y/yes 更新，其他退出)", flush=True)
         do_update = args.yes
         if not do_update:
@@ -665,7 +677,7 @@ def main() -> None:
         print("[安装] 阶段：购买参数将来自调用输入（JSON）或环境变量", flush=True)
     else:
         print(
-            "[安装] 观察到您未处在阿里云 ECS 环境内，需要您手动输入地域、VPC、可用区、交换机等参数来创建一个 Serverless 基础版实例，并自行保证网络可达；安装完成后可能需要在 ~/.openclaw/openclaw.json 中修改数据库连接域名。",
+            f"[安装] 观察到您未处在阿里云 ECS 环境内，需要您手动输入地域、VPC、可用区、交换机等参数来创建一个 Serverless 基础版实例，并自行保证网络可达；安装完成后可能需要在 OpenClaw 配置目录 openclaw.json 中修改数据库连接域名。",
             flush=True,
         )
 
@@ -790,16 +802,8 @@ export MYSQL_DATABASE="openclaw_memory"
     print(f"[安装] 阶段：已追加环境变量到 {bashrc}。", flush=True)
 
     dashscope_key = (os.environ.get("DASHSCOPE_API_KEY") or "").strip()
-    oc_config_dir = _get_openclaw_config_dir_from_cli()
-    if not oc_config_dir:
-        oc_config_dir = os.path.expanduser("~/.openclaw")
-        print(
-            "[安装] 未能通过 openclaw config file | grep openclaw.json 解析配置目录，"
-            f"回退在 {oc_config_dir} 写入 .env。",
-            flush=True,
-        )
     env_path = _write_openclaw_dotenv(
-        oc_config_dir,
+        config_dir,
         mysql_host=connection_string,
         mysql_user=account_name,
         mysql_password=account_password,
@@ -880,10 +884,9 @@ export MYSQL_DATABASE="openclaw_memory"
         sys.exit(1)
     print(f"[安装] 阶段：npm 包已安装至 {plugin_path}", flush=True)
 
-    # 合并写入 ~/.openclaw/openclaw.json
-    openclaw_dir = os.path.expanduser("~/.openclaw")
-    openclaw_json_path = os.path.join(openclaw_dir, "openclaw.json")
-    os.makedirs(openclaw_dir, exist_ok=True)
+    # 合并写入 OpenClaw 配置目录 openclaw.json（与 .env 同目录）
+    openclaw_json_path = os.path.join(config_dir, "openclaw.json")
+    os.makedirs(config_dir, exist_ok=True)
     if os.path.isfile(openclaw_json_path):
         with open(openclaw_json_path, "r", encoding="utf-8") as f:
             openclaw_cfg = json.load(f)
