@@ -1,6 +1,6 @@
 ---
 name: openclaw-memory-alibaba-mysql-install-skill
-description: 安装 OpenClaw 阿里云 RDS 记忆插件环境。脚本或 Agent 遇错、失败、超时均勿自行重试；须把完整输出给用户后再由用户决定。每次执行 install.py/update.py 前须依赖检查。仅升级用 update.py。建议密钥写在 OpenClaw 配置目录的 .env；改后 gateway 重启。须用户同意；非交互必须 --yes。
+description: 安装 OpenClaw 阿里云 RDS 记忆插件环境。ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET、DASHSCOPE 按优先级从环境变量、~/.bashrc、配置目录 .env 读取；写 .env 后直接运行 install，安装成功后再 gateway 重启。脚本或 Agent 遇错勿自行重试。每次执行前须依赖检查。仅升级用 update.py。须用户同意；非交互必须 --yes。
 keywords: openclaw, memory, rds, aliyun, mysql, install.py
 ---
 
@@ -35,21 +35,23 @@ keywords: openclaw, memory, rds, aliyun, mysql, install.py
 - **应做**：把 **完整 stderr/stdout 与退出原因**交给用户；可说明可能原因（网络、代理等），但**不要**在用户未开口前自动重跑或重试。待用户修好环境并**明确同意**后再执行 **`install.py`** 或 **`update.py`**——**不要**裸 `npm install` 当修复手段。
 - **半截状态**：若日志显示 **RDS 已创建成功**但后续步骤失败，**不要盲目**重跑完整 `install.py`（可能再次尝试购实例或进入未定义状态）。应先向用户说明现状，由用户结合控制台与脚本输出决定：例如仅修网络后是否只适跑 **`update.py`**、或需人工清理资源后再装——**此类分支以用户确认为准**，Skill 不替用户自动选「手动 npm」捷径。
 
-## 环境变量（须进入运行 `install.py` 的进程环境）
+## 环境变量（`install.py` 的读取逻辑）
 
 **首选**：用户在本机自行配置，**不要在聊天里发送完整密钥**；助手也不要在回复中**复述**用户口述的密钥全文。
 
-**建议写入 OpenClaw 配置目录下的 `.env`**
+**`install.py` 在启动时按以下优先级加载三个必填变量**（缺则退出）：
 
-- 将 `ALIBABA_CLOUD_ACCESS_KEY_ID`、`ALIBABA_CLOUD_ACCESS_KEY_SECRET`、`DASHSCOPE_API_KEY`（以及非 ECS 时可选的 `OPENCLAW_*` 四项等）写在 **OpenClaw 配置目录**下的 **`.env`** 中（配置目录由 `openclaw config file | grep openclaw.json` 解析，解析失败时回退 `~/.openclaw`）。
-- 这样与网关、技能进程加载环境变量的方式一致；**修改 `.env` 后通常需要执行 `openclaw gateway restart`（或等价重启）**，正在运行的网关才会重新读到新值。
-- `install.py` 从**当前执行它的 shell 进程**读环境变量（`export`、或该终端已由启动器加载 `.env`）；仅改 `.env` 而不重启网关，**不一定**影响你手动开的另一个终端里的脚本，除非该终端也会加载同一份 `.env`。
+1. **环境变量**（当前进程已 `export` 的）
+2. **`~/.bashrc`**（解析 `KEY=value` 或 `export KEY=value` 行）
+3. **OpenClaw 配置目录下的 `.env`**（配置目录由 `openclaw config file | grep openclaw.json` 解析，解析失败时回退 `~/.openclaw`）
+
+任一处写全即可，**无需**在写 `.env` 后先 `source` 或重启 gateway 再跑脚本；脚本会自行读取。
+
+**修改 OpenClaw 配置目录 `.env` 后**，**已运行的网关**需 **`openclaw gateway restart`**（或等价重启）才会重新加载；但**不要在写 `.env` 后立即重启**——应先运行 `install.py` 并让用户看到完整安装进度，**安装成功后再**提示用户执行 gateway 重启。否则 gateway 重启会导致聊天界面重载，用户无法看到正在进行的安装。
 
 **检查阶段未通过：用户口述密钥、由 AI 协助写入文件时**
 
-- 在**依赖/自检**或脚本报「缺少环境变量」时，用户可能通过交互口述 **AK/SK、`DASHSCOPE_API_KEY`**，请 AI 帮忙写入本机。写入后必须向用户说明**如何生效**（二者择一，与落盘位置一致）：
-  - 若写在 **OpenClaw 配置目录的 `.env`**：改完后需要 **`openclaw gateway restart`**（或等价重启网关），否则**已在跑的网关**不会重新加载该文件。
-  - 若写在 **`~/.bashrc`**（`export ALIBABA_CLOUD_…` / `export DASHSCOPE_API_KEY=…`）：在**即将运行 `install.py` 的同一个终端**执行 **`source ~/.bashrc`**（或新开一个会加载 `~/.bashrc` 的登录 shell），否则**当前 shell 里**脚本仍读不到新变量。
+- 用户可能通过交互口述 **ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET、`DASHSCOPE_API_KEY`**，请 AI 帮忙写入。写入后**直接运行 `install.py`** 即可（脚本会从 `.env` 或 `~/.bashrc` 读取）；**不要**在写完后立即执行 `openclaw gateway restart`，以免聊天界面重载、用户看不到安装进度。
 
 **必填（脚本会校验，缺失则退出）**
 
@@ -118,7 +120,7 @@ keywords: openclaw, memory, rds, aliyun, mysql, install.py
 
 1. **Python**：版本 **≥ 3.8**（`python3 --version`）。**仅运行 `install.py` 时**：在 **本仓库根目录**执行 **`pip install -r requirements.txt`**，并确保 `alibabacloud-rds20140815`、`alibabacloud_tea_openapi` 可导入（可选：`python3 -c "from alibabacloud_rds20140815.client import Client"`）。**运行 `update.py` 前**仍须确认本机 **`python3` 可执行该脚本**，但不必为 `update.py` 单独安装 RDS SDK。
 2. **Node.js / npm**：已安装且在 PATH 中（`node --version`、`npm --version`）；两脚本都会在 **`~/.openclaw/plugins`** 下执行 **`npm install`**（或等价逻辑），**缺一不可**。
-3. **环境变量（仅 `install.py`）**：执行 **`install.py`** 的 shell 已能读到上文「必填」变量；若刚写入 `.env` / `~/.bashrc`，须已按 **「检查阶段未通过」** 完成 **gateway 重启** 或 **`source ~/.bashrc`**。非 ECS 且非交互时备好 **`OPENCLAW_*`** 或位置参数 JSON。**`update.py` 不依赖** AK/SK / `DASHSCOPE_API_KEY`。
+3. **环境变量（仅 `install.py`）**：三个必填变量（ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET、`DASHSCOPE_API_KEY`）须已写入 **环境变量**、**`~/.bashrc`** 或 **OpenClaw 配置目录 `.env`** 中任一处（脚本会按此优先级读取，无需 `source` 或 gateway 重启后再跑）。非 ECS 且非交互时备好 **`OPENCLAW_*`** 或位置参数 JSON。**`update.py` 不依赖** ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET / `DASHSCOPE_API_KEY`。
 4. **`openclaw` CLI（建议，仅 `install.py`）**：脚本通过 `openclaw config file | grep openclaw.json` 解析配置目录；若 `openclaw` 不在 PATH 或解析失败，回退 `~/.openclaw`。
 5. **网络**：**两脚本**均需 **npm 源可达**；**仅 `install.py`** 另需本机可访问 **阿里云 API**（及账号权限）。
 

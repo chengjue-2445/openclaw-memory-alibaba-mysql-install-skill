@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 OpenClaw Memory 阿里云 MySQL 一键安装脚本。
-流程：费用确认 → AKSK → 购买 MySQL 8.0 实例 → 轮询 Running → 开启向量 → 建库 → 建账号+授权+白名单 → 写入 ~/.bashrc 与 OpenClaw 配置目录下 .env
+流程：费用确认 → ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET → 购买 MySQL 8.0 实例 → 轮询 Running → 开启向量 → 建库 → 建账号+授权+白名单 → 写入 ~/.bashrc 与 OpenClaw 配置目录下 .env
 全部通过 alibabacloud_rds20140815 SDK 完成，不依赖 rds-openapi-skill。
 
 【不重试】本脚本遇错即退出，不做任何自动重试；调用方请勿在失败后自动重试，应把错误信息反馈给用户后由用户决定是否重新执行。
@@ -25,6 +25,79 @@ from urllib.error import URLError, HTTPError
 
 # 购买参数 JSON 所需键名（仅地域与网络；实例固定为基础版 Serverless，无需用户指定规格/存储）
 PARAM_KEYS = ("region_id", "vpc_id", "vswitch_id", "zone_id")
+
+# 必填凭证变量，按优先级从环境变量、~/.bashrc、OpenClaw 配置目录 .env 读取
+_REQUIRED_ENV_VARS = ("ALIBABA_CLOUD_ACCESS_KEY_ID", "ALIBABA_CLOUD_ACCESS_KEY_SECRET", "DASHSCOPE_API_KEY")
+
+
+def _parse_env_file(path: str) -> Dict[str, str]:
+    """解析 KEY=value 或 export KEY=value 行，返回 {key: value}。"""
+    result: Dict[str, str] = {}
+    if not os.path.isfile(path):
+        return result
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.lower().startswith("export "):
+                    line = line[7:].strip()
+                if "=" in line:
+                    idx = line.index("=")
+                    key = line[:idx].strip()
+                    val = line[idx + 1 :].strip()
+                    if val.startswith('"') and val.endswith('"') and len(val) >= 2:
+                        val = val[1:-1].replace('\\"', '"')
+                    elif val.startswith("'") and val.endswith("'") and len(val) >= 2:
+                        val = val[1:-1].replace("\\'", "'")
+                    if key:
+                        result[key] = val
+    except (OSError, UnicodeDecodeError):
+        pass
+    return result
+
+
+def _load_required_env_vars(config_dir: str) -> None:
+    """按优先级加载三个必填变量：1. 环境变量 2. ~/.bashrc 3. 配置目录 .env。缺则退出。"""
+    missing = list(_REQUIRED_ENV_VARS)
+
+    # 1. 从环境变量
+    for v in list(missing):
+        if os.environ.get(v) and str(os.environ.get(v)).strip():
+            missing.remove(v)
+    if not missing:
+        print("[安装] 阶段：ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET、DASHSCOPE_API_KEY 已从环境变量就绪", flush=True)
+        return
+
+    # 2. 从 ~/.bashrc
+    bashrc = os.path.expanduser("~/.bashrc")
+    parsed = _parse_env_file(bashrc)
+    for v in list(missing):
+        if parsed.get(v) and str(parsed.get(v)).strip():
+            os.environ[v] = str(parsed[v]).strip()
+            missing.remove(v)
+    if not missing:
+        print(f"[安装] 阶段：ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET、DASHSCOPE_API_KEY 已从 {bashrc} 加载", flush=True)
+        return
+
+    # 3. 从 OpenClaw 配置目录 .env
+    env_path = os.path.join(config_dir, ".env")
+    parsed = _parse_env_file(env_path)
+    for v in list(missing):
+        if parsed.get(v) and str(parsed.get(v)).strip():
+            os.environ[v] = str(parsed[v]).strip()
+            missing.remove(v)
+
+    if missing:
+        print(
+            f"错误：缺失 {', '.join(missing)}。已尝试：1. 环境变量 2. ~/.bashrc 3. OpenClaw 配置目录 .env（{env_path}），均未找到。\n"
+            "请将上述变量写入其中任一处后重试。DASHSCOPE_API_KEY 可前往 https://bailian.console.aliyun.com 申请。",
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(1)
+    print(f"[安装] 阶段：ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET、DASHSCOPE_API_KEY 已从 {env_path} 加载", flush=True)
 
 # ECS 实例元数据（加固模式），仅 ECS 内可访问
 _ECS_METADATA_BASE = "http://100.100.100.200/latest"
@@ -191,31 +264,6 @@ def step1_confirm() -> None:
     if line not in ("y", "yes"):
         print("已取消。", flush=True)
         sys.exit(0)
-
-
-# 步骤 2：读取 AKSK
-def step2_aksk() -> tuple[str, str, Optional[str]]:
-    ak = os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_ID")
-    sk = os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_SECRET")
-    sts = os.environ.get("ALIBABA_CLOUD_SECURITY_TOKEN")
-    if not ak or not sk:
-        print("错误：请设置环境变量 ALIBABA_CLOUD_ACCESS_KEY_ID 和 ALIBABA_CLOUD_ACCESS_KEY_SECRET。", file=sys.stderr, flush=True)
-        sys.exit(1)
-    return ak, sk, sts
-
-
-# 步骤 2b：申请实例前检查 DASHSCOPE_API_KEY
-def step2b_check_dashscope_api_key() -> None:
-    key = os.environ.get("DASHSCOPE_API_KEY")
-    if not key or not str(key).strip():
-        print(
-            "错误：需要设置环境变量 DASHSCOPE_API_KEY。\n"
-            "记忆插件将使用百炼进行向量与对话，请前往阿里巴巴百炼平台申请 API Key：\n"
-            "https://bailian.console.aliyun.com",
-            file=sys.stderr,
-            flush=True,
-        )
-        sys.exit(1)
 
 
 def _get_params_from_json(params_json: str) -> Dict[str, str]:
@@ -616,7 +664,7 @@ def _already_installed(config_dir: str) -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="安装 openclaw-memory-alibaba-mysql（阿里云 RDS + 插件注册）。AK/SK、DASHSCOPE_API_KEY 从环境变量读取；购买参数可从命令行 JSON 传入。"
+        description="安装 openclaw-memory-alibaba-mysql（阿里云 RDS + 插件注册）。ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET、DASHSCOPE_API_KEY 按优先级从环境变量、~/.bashrc、OpenClaw 配置目录 .env 读取；购买参数可从命令行 JSON 传入。"
     )
     parser.add_argument(
         "params_json",
@@ -645,6 +693,8 @@ def main() -> None:
         )
     else:
         print(f"[安装] 阶段：OpenClaw 配置目录 {config_dir}", flush=True)
+
+    _load_required_env_vars(config_dir)
 
     if _already_installed(config_dir):
         print("检测到已安装 openclaw-memory-alibaba-mysql（plugins.slots.memory 已配置）。是否更新 openclaw-memory-alibaba-mysql 插件？(y/yes 更新，其他退出)", flush=True)
@@ -686,10 +736,6 @@ def main() -> None:
         print("[安装] 阶段：用户已确认费用与流程", flush=True)
     else:
         print("[安装] 阶段：已使用 --yes，跳过确认", flush=True)
-    step2_aksk()
-    print("[安装] 阶段：AKSK 校验通过（来自环境变量）", flush=True)
-    step2b_check_dashscope_api_key()
-    print("[安装] 阶段：DASHSCOPE_API_KEY 校验通过（来自环境变量）", flush=True)
 
     # ECS 元数据优先：有则一律采用，忽略命令行/环境变量中的购买参数
     if ecs_params:
