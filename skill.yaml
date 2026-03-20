@@ -15,7 +15,7 @@ entry_points:
     command: python3 scripts/update.py
     description: 仅升级插件包、不创建 RDS；执行前须先做依赖检查（Python/npm/网络）。【禁止】失败/超时后自行重试。Skill 未加载时可用仓库绝对路径。
 
-# 执行时建议（若平台支持）：无缓冲输出、定期轮询日志、流式转发
+# 执行时建议（若平台支持）：无缓冲输出、定期轮询日志、流式转发；install.py 的 execution/poll timeout 至少 20 分钟
 # runtime:
 #   unbuffered: true
 #   logPollInterval: 5

@@ -19,6 +19,7 @@ keywords: openclaw, memory, rds, aliyun, mysql, install.py
 
 - 脚本会调用阿里云 API **创建 RDS 实例**等，可能**计费**；文案与脚本一致：基础版 Serverless、起步成本相对较低，之后可在控制台改规格。
 - 创建与就绪轮询等步骤耗时较长，**约数分钟到十余分钟量级**（脚本内创建 API 单次最长等待 300 秒，实例变 Running 最长轮询 3600 秒）。
+- **执行超时**：若由 Agent/工具调用 `install.py`，其 process poll 或 execution timeout 应至少 **20 分钟**（1200 秒）。否则进程可能在 npm 阶段（需下载 200+ 包）被提前 SIGTERM 终止，表现为「npm 超时」实为调用方超时。
 - **遇错即退出**，脚本**不做自动重试**。
 - **Agent / 助手禁止自行重试**：脚本一旦**失败、超时或异常退出**，**不得**在未获用户**明确指示**前再次执行、循环重试或改用手动命令代替。应**停止**，把 **完整 stdout/stderr 与退出码**交给用户，由用户决定下一步。
 
@@ -136,7 +137,7 @@ keywords: openclaw, memory, rds, aliyun, mysql, install.py
 1. **工作目录与依赖**：本仓库根目录（含 `scripts/install.py`、`requirements.txt` / `update.py`）。**先完成上一节依赖检查**，再运行 **`install.py` 或 `update.py`**（**每次**执行任一脚本前都须检查，**不要**跳过）。
 2. **已安装检测（跑 `install.py` 前先看）**：仅当 **OpenClaw 配置目录内 `openclaw.json`** 中 **`plugins.slots.memory` 为 `openclaw-memory-alibaba-mysql`** 时，再运行 `install.py` 才会进入「是否仅更新插件」；确认 **y/yes** 或 **`--yes`** 会转调 **`scripts/update.py`** 并退出。**若不满足该条件，本条不生效**，脚本会走完整安装（见上文「更新误走完整安装」）。若用户只要升级插件包、不要动 RDS，应直接用 **`python3 scripts/update.py`**，见本节末段。
 3. **只运行安装脚本**：`python3 scripts/install.py`（或 `python`）。**不要**为同一目的再手动建实例、**不要在 npm 超时/失败后用手动 `npm install` 补装**、不要手改 `~/.openclaw/openclaw.json` 完成同一套安装（见上文 **「禁止在 npm 失败/超时后手动补装」**）。任一脚本**失败或超时后**，**不要自行立刻再跑一遍**；须用户看过日志并明确说要重试后再执行（见上文 **「Agent 禁止自行重试」**）。
-4. **日志**：建议使用 `PYTHONUNBUFFERED=1 python3 scripts/install.py` 或 `python3 -u ...`，并把 **stdout/stderr 完整**交给用户。
+4. **日志**：建议使用 `PYTHONUNBUFFERED=1 python3 scripts/install.py` 或 `python3 -u ...`，并把 **stdout/stderr 完整**交给用户。**Agent/工具调用时**：process poll 或 execution timeout 应至少 **20 分钟**，否则 install.py 可能在 npm 阶段被提前终止。
 5. **参数形式**（与 `argparse` 一致）：可选 **`--yes` / `-y`**；可选**位置参数** `params_json`（一整段 JSON 字符串，须含 `region_id`、`vpc_id`、`vswitch_id`、`zone_id`）。示例（用户已同意、非交互）：  
    `python3 scripts/install.py --yes '{"region_id":"cn-hangzhou","vpc_id":"vpc-xxx","vswitch_id":"vsw-xxx","zone_id":"cn-hangzhou-h"}'`
 6. **非 ECS**：脚本会提示安装后**可能**需在 **OpenClaw 配置目录的 `openclaw.json`** 里调整数据库连接地址以保证网络可达（与脚本 stdout 一致）。
