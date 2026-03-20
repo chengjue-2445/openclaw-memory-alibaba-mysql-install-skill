@@ -975,10 +975,14 @@ export MYSQL_DATABASE="openclaw_memory"
             "tableName": "openclaw_memories",
         },
     }
-    if "allow" not in pl:
-        pl["allow"] = []
-    if "openclaw-memory-alibaba-mysql" not in pl["allow"]:
-        pl["allow"].append("openclaw-memory-alibaba-mysql")
+    # plugins.allow（OpenClaw 文档）：字段不存在 = 全部允许、无启动警告；allow: [] = 非捆绑插件仍可加载，仅 logs a startup warning；
+    # 非空 allow = 白名单。故不新建 allow、不向 [] 追加；仅当已存在且为非空 list 时再追加本插件；类型不对则跳过。
+    _plugin_allow_id = "openclaw-memory-alibaba-mysql"
+    if "allow" in pl:
+        existing_allow = pl["allow"]
+        if isinstance(existing_allow, list) and len(existing_allow) > 0:
+            if _plugin_allow_id not in existing_allow:
+                existing_allow.append(_plugin_allow_id)
     with open(openclaw_json_path, "w", encoding="utf-8") as f:
         json.dump(openclaw_cfg, f, indent=2, ensure_ascii=False)
     print(f"[安装] 阶段：已在 {openclaw_json_path} 中注册插件 openclaw-memory-alibaba-mysql。", flush=True)
