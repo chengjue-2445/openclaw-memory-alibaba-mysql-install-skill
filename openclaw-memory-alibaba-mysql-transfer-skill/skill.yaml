@@ -1,0 +1,15 @@
+# OpenClaw / ClawHub 用 skill 清单
+name: openclaw-memory-alibaba-mysql-transfer-skill
+version: "1.0.0"
+description: 从 workspace/MEMORY.md 迁移记忆到 RDS 向量库（Agent 驱动）。当用户说「迁移本地记忆到 RDS 记忆插件」等类似表述时，读取 OpenClaw 配置目录下 workspace/MEMORY.md，逐行调用 memory_store 导入。
+author: OpenClaw Memory
+
+capabilities:
+  - 读取 OpenClaw 配置目录下 workspace/MEMORY.md，逐行调用 memory_store 导入记忆到 RDS 向量库
+
+# 无 CLI 入口，纯 Agent 驱动；Agent 通过 SKILL.md 匹配用户意图后按步骤执行
+requires:
+  bins: []
+
+os: [darwin, linux]
+
