@@ -1,0 +1,191 @@
+{
+  "id": "openclaw-memory-alibaba-mysql",
+  "name": "openclaw-memory-alibaba-mysql",
+  "description": "Long-term memory with vector search. Categories: user_memory_*, self_improving_*. Optional LLM-based dedup/conflict.",
+  "configSchema": {
+    "type": "object",
+    "required": ["mysql", "embedding"],
+    "additionalProperties": false,
+    "properties": {
+      "mysql": {
+        "type": "object",
+        "required": ["host", "user", "password", "database"],
+        "additionalProperties": false,
+        "properties": {
+          "host": { "type": "string", "default": "" },
+          "port": { "type": "number", "default": 3306 },
+          "user": { "type": "string", "default": "" },
+          "password": { "type": "string", "default": "" },
+          "database": { "type": "string", "default": "openclaw_memory" },
+          "ssl": { "type": "boolean", "default": false }
+        }
+      },
+      "embedding": {
+        "type": "object",
+        "required": ["apiKey"],
+        "additionalProperties": false,
+        "properties": {
+          "apiKey": { "type": "string", "default": "" },
+          "model": { "type": "string", "default": "text-embedding-v3" },
+          "baseUrl": { "type": "string", "default": "https://dashscope.aliyuncs.com/compatible-mode/v1" },
+          "dimensions": { "type": "number", "default": 1024 }
+        }
+      },
+      "memory_duplication_conflict_process": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, use LLM to decide insert vs update among top-10 similar memories; requires llm."
+      },
+      "llm": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Required when memory_duplication_conflict_process or memoryExtractionMethod is llm.",
+        "properties": {
+          "apiKey": { "type": "string", "default": "" },
+          "model": { "type": "string", "default": "qwen-plus" },
+          "baseUrl": { "type": "string", "default": "https://dashscope.aliyuncs.com/compatible-mode/v1" }
+        }
+      },
+      "similarityThresholdUserMemory": { "type": "number", "default": 0.65 },
+      "similarityThresholdSelfImproving": { "type": "number", "default": 0.62 },
+      "enableFullContextMemory": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, allow write/recall for full_context_memory."
+      },
+      "enableSelfImprovingMemory": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, allow write/recall for self_improving_*."
+      },
+      "memoryExtractionMethod": {
+        "type": "string",
+        "enum": ["regex", "llm"],
+        "default": "regex",
+        "description": "Extraction method for both user_memory_* and self_improving_*: 'regex' or 'llm'. Requires llm config when 'llm'."
+      },
+      "autoRecall": { "type": "boolean", "default": true },
+      "autoCapture": { "type": "boolean", "default": true },
+      "captureMaxChars": { "type": "number", "default": 50000 },
+      "enableMemoryDecay": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, apply time decay to recall scores (default: 30 days half-life, exponential)."
+      },
+      "tableName": { "type": "string", "default": "openclaw_memories" }
+    }
+  },
+  "uiHints": {
+    "mysql.host": {
+      "label": "MySQL Host",
+      "placeholder": "rm-xxx.rds.aliyuncs.com",
+      "help": "MySQL host (supports ${MYSQL_HOST})"
+    },
+    "mysql.port": {
+      "label": "MySQL Port",
+      "placeholder": "3306"
+    },
+    "mysql.user": {
+      "label": "MySQL User",
+      "placeholder": "root",
+      "help": "Supports ${MYSQL_USER}"
+    },
+    "mysql.password": {
+      "label": "MySQL Password",
+      "sensitive": true,
+      "placeholder": "••••••••",
+      "help": "Supports ${MYSQL_PASSWORD}"
+    },
+    "mysql.database": {
+      "label": "Database Name",
+      "placeholder": "openclaw_memory",
+      "help": "Database name (table created automatically)"
+    },
+    "mysql.ssl": {
+      "label": "SSL",
+      "help": "Use SSL for MySQL connection"
+    },
+    "embedding.apiKey": {
+      "label": "Embedding API Key",
+      "sensitive": true,
+      "placeholder": "••••••••",
+      "help": "DashScope/OpenAI-compatible API key (supports ${DASHSCOPE_API_KEY})"
+    },
+    "embedding.model": {
+      "label": "Embedding Model",
+      "placeholder": "text-embedding-v3"
+    },
+    "embedding.baseUrl": {
+      "label": "Embedding Base URL",
+      "placeholder": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "help": "OpenAI-compatible embedding API base URL"
+    },
+    "embedding.dimensions": {
+      "label": "Embedding Dimensions",
+      "placeholder": "1024",
+      "help": "Vector dimension (e.g. 1024 for text-embedding-v3)"
+    },
+    "llm.apiKey": {
+      "label": "LLM API Key",
+      "sensitive": true,
+      "placeholder": "••••••••",
+      "help": "Required when memoryExtractionMethod is llm or conflict process is enabled"
+    },
+    "llm.model": {
+      "label": "LLM Model",
+      "placeholder": "qwen-plus"
+    },
+    "llm.baseUrl": {
+      "label": "LLM Base URL",
+      "placeholder": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    },
+    "memory_duplication_conflict_process": {
+      "label": "Conflict / Dedup (LLM)",
+      "help": "Use LLM to decide insert vs update for similar memories; requires llm config"
+    },
+    "similarityThresholdUserMemory": {
+      "label": "User Memory Similarity Threshold",
+      "placeholder": "0.65",
+      "help": "0–1, for user_memory_* dedup and recall"
+    },
+    "similarityThresholdSelfImproving": {
+      "label": "Self-Improving Similarity Threshold",
+      "placeholder": "0.62",
+      "help": "0–1, for self_improving_*"
+    },
+    "enableFullContextMemory": {
+      "label": "Enable Full Context Memory",
+      "help": "Store full conversation context (not used in recall)"
+    },
+    "enableSelfImprovingMemory": {
+      "label": "Enable Self-Improving Memory",
+      "help": "Store and recall learnings/errors/feature requests"
+    },
+    "memoryExtractionMethod": {
+      "label": "Extraction Method",
+      "help": "regex = pattern-based; llm = LLM extracts (requires llm config)"
+    },
+    "autoRecall": {
+      "label": "Auto Recall",
+      "help": "Inject relevant memories at conversation start"
+    },
+    "autoCapture": {
+      "label": "Auto Capture",
+      "help": "Extract and store memories at conversation end"
+    },
+    "captureMaxChars": {
+      "label": "Capture Max Chars",
+      "placeholder": "500",
+      "help": "Max length per captured memory (100–100000)"
+    },
+    "enableMemoryDecay": {
+      "label": "Enable Memory Decay",
+      "help": "Older memories get lower score in recall (30 days half-life, exponential)"
+    },
+    "tableName": {
+      "label": "Table Name",
+      "placeholder": "openclaw_memories",
+      "help": "MySQL table name (alphanumeric + underscore)"
+    }
+  }
+}

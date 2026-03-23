@@ -1,0 +1,46 @@
+{
+  "name": "openclaw-memory-alibaba-local",
+  "version": "0.1.0",
+  "description": "OpenClaw memory plugin: local LanceDB + DashScope-compatible embeddings",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chengjue-2445/openclaw-memory-alibaba-mysql-install-skill.git",
+    "directory": "openclaw-memory-alibaba-local"
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "memory",
+    "lancedb",
+    "vector-search"
+  ],
+  "files": [
+    "index.ts",
+    "config.ts",
+    "db.ts",
+    "categories.ts",
+    "prompts.ts",
+    "web/memory-routes.ts",
+    "web/memory-ui.ts",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "dependencies": {
+    "@lancedb/lancedb": "^0.27.1",
+    "@sinclair/typebox": "0.34.48",
+    "openai": "^6.25.0"
+  },
+  "peerDependencies": {
+    "openclaw": "*"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "devDependencies": {
+    "typescript": "^6.0.2"
+  }
+}

@@ -1,0 +1,150 @@
+{
+  "id": "openclaw-memory-alibaba-local",
+  "name": "openclaw-memory-alibaba-local",
+  "description": "Local LanceDB long-term memory; user_memory_*, self_improving_*; DashScope-friendly defaults; table openclaw_memories_alibaba_local.",
+  "configSchema": {
+    "type": "object",
+    "required": ["embedding"],
+    "additionalProperties": false,
+    "properties": {
+      "dbPath": {
+        "type": "string",
+        "default": "",
+        "description": "LanceDB directory (default: ~/.openclaw/memory/lancedb, same as official memory-lancedb)."
+      },
+      "embedding": {
+        "type": "object",
+        "required": ["apiKey"],
+        "additionalProperties": false,
+        "properties": {
+          "apiKey": { "type": "string", "default": "" },
+          "model": { "type": "string", "default": "text-embedding-v3" },
+          "baseUrl": { "type": "string", "default": "https://dashscope.aliyuncs.com/compatible-mode/v1" },
+          "dimensions": { "type": "number", "default": 1024 }
+        }
+      },
+      "memory_duplication_conflict_process": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, use LLM to decide insert vs update among similar memories; requires llm."
+      },
+      "llm": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Required when memory_duplication_conflict_process or memoryExtractionMethod is llm.",
+        "properties": {
+          "apiKey": { "type": "string", "default": "" },
+          "model": { "type": "string", "default": "qwen-plus" },
+          "baseUrl": { "type": "string", "default": "https://dashscope.aliyuncs.com/compatible-mode/v1" }
+        }
+      },
+      "similarityThresholdUserMemory": { "type": "number", "default": 0.65 },
+      "similarityThresholdSelfImproving": { "type": "number", "default": 0.62 },
+      "enableFullContextMemory": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, store full_context_* by role (upsert per session)."
+      },
+      "enableSelfImprovingMemory": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, allow self_improving_* write and recall."
+      },
+      "memoryExtractionMethod": {
+        "type": "string",
+        "enum": ["regex", "llm"],
+        "default": "llm",
+        "description": "regex or llm; llm requires llm config."
+      },
+      "autoRecall": { "type": "boolean", "default": true },
+      "autoCapture": { "type": "boolean", "default": true },
+      "captureMaxChars": { "type": "number", "default": 50000 },
+      "enableMemoryDecay": {
+        "type": "boolean",
+        "default": false,
+        "description": "Recall time decay (30d half-life, exponential)."
+      }
+    }
+  },
+  "uiHints": {
+    "dbPath": {
+      "label": "LanceDB Path",
+      "placeholder": "~/.openclaw/memory/lancedb",
+      "help": "Same default as official memory-lancedb; table openclaw_memories_alibaba_local inside this directory."
+    },
+    "embedding.apiKey": {
+      "label": "Embedding API Key",
+      "sensitive": true,
+      "placeholder": "••••••••",
+      "help": "DashScope/OpenAI-compatible (supports ${DASHSCOPE_API_KEY})"
+    },
+    "embedding.model": {
+      "label": "Embedding Model",
+      "placeholder": "text-embedding-v3"
+    },
+    "embedding.baseUrl": {
+      "label": "Embedding Base URL",
+      "placeholder": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    },
+    "embedding.dimensions": {
+      "label": "Embedding Dimensions",
+      "placeholder": "1024"
+    },
+    "llm.apiKey": {
+      "label": "LLM API Key",
+      "sensitive": true,
+      "placeholder": "••••••••",
+      "help": "Required when memoryExtractionMethod is llm or conflict process is enabled"
+    },
+    "llm.model": {
+      "label": "LLM Model",
+      "placeholder": "qwen-plus"
+    },
+    "llm.baseUrl": {
+      "label": "LLM Base URL",
+      "placeholder": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    },
+    "memory_duplication_conflict_process": {
+      "label": "Conflict / Dedup (LLM)",
+      "help": "LLM decides insert vs update; requires llm config"
+    },
+    "similarityThresholdUserMemory": {
+      "label": "User Memory Similarity Threshold",
+      "placeholder": "0.65",
+      "help": "0–1; L2 score = 1/(1+distance), same as official memory-lancedb"
+    },
+    "similarityThresholdSelfImproving": {
+      "label": "Self-Improving Similarity Threshold",
+      "placeholder": "0.62"
+    },
+    "enableFullContextMemory": {
+      "label": "Enable Full Context Memory",
+      "help": "Per-role conversation snapshots per session"
+    },
+    "enableSelfImprovingMemory": {
+      "label": "Enable Self-Improving Memory",
+      "help": "Learnings / errors / feature requests"
+    },
+    "memoryExtractionMethod": {
+      "label": "Extraction Method",
+      "help": "regex or llm (default llm)"
+    },
+    "autoRecall": {
+      "label": "Auto Recall",
+      "help": "Inject memories at conversation start"
+    },
+    "autoCapture": {
+      "label": "Auto Capture",
+      "help": "Store memories at conversation end"
+    },
+    "captureMaxChars": {
+      "label": "Capture Max Chars",
+      "placeholder": "50000",
+      "help": "100–100000"
+    },
+    "enableMemoryDecay": {
+      "label": "Enable Memory Decay",
+      "help": "Older memories score lower on recall"
+    }
+  }
+}

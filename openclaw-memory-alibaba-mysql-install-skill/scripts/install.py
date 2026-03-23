@@ -897,7 +897,7 @@ export MYSQL_DATABASE="openclaw_memory"
             cwd=plugins_dir,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=30,
         )
 
     print(f"[安装] 阶段：安装 npm 包（优先 registry: {npm_registry_cn}）...", flush=True)

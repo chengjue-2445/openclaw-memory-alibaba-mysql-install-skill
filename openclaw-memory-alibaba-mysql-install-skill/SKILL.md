@@ -1,6 +1,6 @@
 ---
 name: openclaw-memory-alibaba-mysql-install-skill
-description: 安装 OpenClaw 阿里云 RDS 记忆插件环境。ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET、DASHSCOPE 按优先级从环境变量、~/.bashrc、配置目录 .env 读取；写 .env 后直接运行 install，安装成功后再 gateway 重启。脚本或 Agent 遇错勿自行重试。每次执行前须依赖检查。仅升级用 update.py。须用户同意；非交互必须 --yes。
+description: 安装 OpenClaw 阿里云 RDS 记忆插件环境。ALIBABA_CLOUD_ACCESS_KEY_ID / ALIBABA_CLOUD_ACCESS_KEY_SECRET、DASHSCOPE 按优先级从环境变量、~/.bashrc、配置目录 .env 读取；写 .env 后直接运行 install，安装成功后再 gateway 重启。脚本或 Agent 遇错勿自行重试。禁止输出 ALIBABA_CLOUD_ACCESS_KEY_ID、ALIBABA_CLOUD_ACCESS_KEY_SECRET、DASHSCOPE_API_KEY、MYSQL_PASSWORD 等凭证。每次执行前须依赖检查。仅升级用 update.py。须用户同意；非交互必须 --yes。
 keywords: openclaw, memory, rds, aliyun, mysql, install.py
 ---
 
@@ -10,6 +10,7 @@ keywords: openclaw, memory, rds, aliyun, mysql, install.py
 
 - **禁止自行重试**：脚本失败、超时或异常退出后，**不得**在未获用户**明确指示**前再次执行、循环重试或改用手动命令代替。应**停止**，把完整 stdout/stderr 与退出码交给用户，由用户决定下一步。
 - **禁止 npm 失败后手动补装**：npm 阶段报错/超时后，**不得**自行执行 `mkdir`、`cd`、`npm install` 等命令代替脚本完成安装。
+- **禁止输出私密信息**：**不得**在日志、回复或任何输出中打印或复述 **ALIBABA_CLOUD_ACCESS_KEY_ID**、**ALIBABA_CLOUD_ACCESS_KEY_SECRET**、**DASHSCOPE_API_KEY**、**MYSQL_PASSWORD** 等凭证的实际值；仅可提及变量名或路径。
 
 ## 何时使用
 
@@ -43,7 +44,7 @@ keywords: openclaw, memory, rds, aliyun, mysql, install.py
 
 ## 环境变量（`install.py` 的读取逻辑）
 
-**首选**：用户在本机自行配置，**不要在聊天里发送完整密钥**；助手也不要在回复中**复述**用户口述的密钥全文。
+**首选**：用户在本机自行配置，**不要在聊天里发送完整密钥**；助手也不要在回复、日志或任何输出中**复述或打印** ALIBABA_CLOUD_ACCESS_KEY_ID、ALIBABA_CLOUD_ACCESS_KEY_SECRET、DASHSCOPE_API_KEY、MYSQL_PASSWORD 等凭证的实际值。
 
 **`install.py` 在启动时按以下优先级加载三个必填变量**（缺则退出）：
 

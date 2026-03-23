@@ -52,7 +52,7 @@ def main() -> None:
             cwd=_PLUGINS_DIR,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=30,
         )
 
     print(f"[更新] 执行 npm install（优先 {_NPM_REGISTRY_CN}）...", flush=True)
