@@ -25,8 +25,8 @@
       },
       "memory_duplication_conflict_process": {
         "type": "boolean",
-        "default": false,
-        "description": "When true, use LLM to decide insert vs update among similar memories; requires llm."
+        "default": true,
+        "description": "When true (default), LLM decides insert vs update among similar memories; requires llm. Set false to disable."
       },
       "llm": {
         "type": "object",
@@ -42,13 +42,13 @@
       "similarityThresholdSelfImproving": { "type": "number", "default": 0.62 },
       "enableFullContextMemory": {
         "type": "boolean",
-        "default": false,
-        "description": "When true, store full_context_* by role (upsert per session)."
+        "default": true,
+        "description": "When true (default), store full_context_* by role (upsert per session). Set false to disable."
       },
       "enableSelfImprovingMemory": {
         "type": "boolean",
-        "default": false,
-        "description": "When true, allow self_improving_* write and recall."
+        "default": true,
+        "description": "When true (default), allow self_improving_* write and recall. Set false to disable."
       },
       "memoryExtractionMethod": {
         "type": "string",
@@ -61,8 +61,8 @@
       "captureMaxChars": { "type": "number", "default": 50000 },
       "enableMemoryDecay": {
         "type": "boolean",
-        "default": false,
-        "description": "Recall time decay (30d half-life, exponential)."
+        "default": true,
+        "description": "When true (default), recall uses time decay (30d half-life, exponential). Set false to disable."
       }
     }
   },
@@ -106,7 +106,7 @@
     },
     "memory_duplication_conflict_process": {
       "label": "Conflict / Dedup (LLM)",
-      "help": "LLM decides insert vs update; requires llm config"
+      "help": "Default on: LLM decides insert vs update. Turn off to use vector-only dedup."
     },
     "similarityThresholdUserMemory": {
       "label": "User Memory Similarity Threshold",
@@ -119,11 +119,11 @@
     },
     "enableFullContextMemory": {
       "label": "Enable Full Context Memory",
-      "help": "Per-role conversation snapshots per session"
+      "help": "Default on: per-role conversation snapshots per session. Turn off to skip full_context_* writes."
     },
     "enableSelfImprovingMemory": {
       "label": "Enable Self-Improving Memory",
-      "help": "Learnings / errors / feature requests"
+      "help": "Default on: learnings / errors / feature requests. Turn off to disable."
     },
     "memoryExtractionMethod": {
       "label": "Extraction Method",
@@ -144,7 +144,7 @@
     },
     "enableMemoryDecay": {
       "label": "Enable Memory Decay",
-      "help": "Older memories score lower on recall"
+      "help": "Default on: older memories score lower on recall. Turn off for flat scores."
     }
   }
 }

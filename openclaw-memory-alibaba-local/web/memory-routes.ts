@@ -78,7 +78,8 @@ function sendJson(res: ServerResponse, status: number, data: unknown): void {
 function sendHtml(res: ServerResponse, html: string): void {
   res.writeHead(200, {
     "Content-Type": "text/html; charset=utf-8",
-    "Cache-Control": "no-cache",
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+    Pragma: "no-cache",
   });
   res.end(html);
 }

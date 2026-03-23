@@ -4,36 +4,63 @@
 
 export function getMemoryPanelHtml(): string {
   const css = `
-:root { font-family: system-ui, sans-serif; color: #e8e8ec; background: #0f1115; }
+:root { font-family: system-ui, sans-serif; color: #e8eef5; background: #0f2847; }
 * { box-sizing: border-box; }
-body { margin: 0; padding: 16px; max-width: 1400px; margin-inline: auto; }
-h1 { font-size: 1.25rem; margin: 0 0 12px; font-weight: 600; }
+body {
+  margin: 0;
+  padding: 16px;
+  max-width: 1400px;
+  margin-inline: auto;
+  min-height: 100vh;
+  background: linear-gradient(180deg, #0f2847 0%, #0c223c 55%, #0a1d35 100%);
+}
+h1 { font-size: 1.25rem; margin: 0 0 12px; font-weight: 600; color: #f0f5fc; }
 .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 12px; }
-.toolbar label { font-size: 0.85rem; color: #a8acb8; }
+.toolbar label { font-size: 0.85rem; color: #9eb0c8; }
 .toolbar input, .toolbar select, .toolbar button {
-  background: #1a1d24; border: 1px solid #2d3340; color: #e8e8ec; border-radius: 6px; padding: 6px 10px; font-size: 0.875rem;
+  background: #153559; border: 1px solid #2d5580; color: #e8eef5; border-radius: 6px; padding: 6px 10px; font-size: 0.875rem;
 }
 .toolbar button { cursor: pointer; }
-.toolbar button:hover { background: #242830; }
+.toolbar button:hover { background: #1a3f66; }
 .toolbar button:disabled { opacity: 0.45; cursor: not-allowed; }
-.tabs { display: flex; gap: 4px; margin-bottom: 12px; border-bottom: 1px solid #2d3340; padding-bottom: 8px; }
+.tabs { display: flex; gap: 4px; margin-bottom: 12px; border-bottom: 1px solid #2d5580; padding-bottom: 8px; }
 .tab {
-  padding: 8px 14px; border-radius: 6px 6px 0 0; cursor: pointer; color: #8b90a0; border: none;
+  padding: 8px 14px; border-radius: 6px 6px 0 0; cursor: pointer; color: #8fa8c4; border: none;
   background: transparent; font-size: 0.9rem;
 }
-.tab.active { background: #1a1d24; color: #e8e8ec; border: 1px solid #2d3340; border-bottom-color: #1a1d24; margin-bottom: -9px; }
+.tab.active { background: #153559; color: #f0f5fc; border: 1px solid #2d5580; border-bottom-color: #153559; margin-bottom: -9px; }
 .tab:disabled { opacity: 0.4; cursor: not-allowed; }
 .banner { padding: 10px 12px; border-radius: 8px; margin-bottom: 12px; font-size: 0.875rem; display: none; }
 .banner.err { display: block; background: #3d1f24; border: 1px solid #8b3a44; color: #ffb4bc; }
 .banner.info { display: block; background: #1f2d3d; border: 1px solid #3a5a8b; color: #b4d4ff; }
 table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
-th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #2d3340; vertical-align: top; }
-th { color: #8b90a0; font-weight: 500; }
-tr:hover td { background: #161920; }
-.text-preview { max-width: 420px; max-height: 4.5em; overflow: hidden; word-break: break-word; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #2a5080; vertical-align: top; }
+th { color: #8fa8c4; font-weight: 500; }
+tr:hover td { background: #132a45; }
+.text-cell { max-width: 560px; }
+.text-preview {
+  max-width: 420px;
+  max-height: 4.5em;
+  overflow: hidden;
+  word-break: break-word;
+  border-radius: 4px;
+  padding: 2px 4px;
+  margin: -2px -4px;
+}
+.text-preview:not(.text-preview-short) { cursor: pointer; outline: none; }
+.text-preview:not(.text-preview-short):hover { background: #1a3d5c; }
+.text-preview.text-preview-short { max-height: none; overflow: visible; max-width: 100%; }
+.text-preview.expanded { max-height: none; overflow: visible; }
+.text-hint {
+  font-size: 0.72rem;
+  color: #6b8aad;
+  margin-top: 6px;
+  user-select: none;
+  cursor: pointer;
+}
 .pager { display: flex; gap: 8px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
 .mono { font-family: ui-monospace, monospace; font-size: 0.78rem; }
-.empty { color: #6b7080; padding: 24px; text-align: center; }
+.empty { color: #7a93b0; padding: 24px; text-align: center; }
 `;
 
   const js = buildClientScript();
@@ -43,16 +70,16 @@ tr:hover td { background: #161920; }
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>OpenClaw 记忆管理</title>
+<title>RDSClaw 记忆管理</title>
 <style>${css}</style>
 </head>
 <body>
-<h1>OpenClaw 记忆管理</h1>
+<h1>RDSClaw 记忆管理</h1>
 <div id="banner" class="banner"></div>
 <div class="tabs" id="tabs">
   <button type="button" class="tab active" data-tab="user">用户记忆</button>
-  <button type="button" class="tab" data-tab="full">全文记忆</button>
   <button type="button" class="tab" data-tab="self">自进化记忆</button>
+  <button type="button" class="tab" data-tab="full">全文记忆</button>
 </div>
 <div class="toolbar">
   <label>时间</label>
@@ -113,7 +140,9 @@ function buildClientScript(): string {
     pageSize: 100,
     total: 0,
     items: [],
-    loading: false
+    loading: false,
+    selectedAgentId: "main",
+    selectedSessionId: ""
   };
 
   function timeBounds() {
@@ -143,8 +172,8 @@ function buildClientScript(): string {
     var t = timeBounds();
     var q = new URLSearchParams();
     q.set("tab", state.tab);
-    var aid = document.getElementById("agentId").value.trim();
-    var sid = document.getElementById("sessionId").value.trim();
+    var aid = state.selectedAgentId.trim();
+    var sid = state.selectedSessionId.trim();
     if (aid) q.set("agentId", aid);
     if (sid) q.set("sessionId", sid);
     if (t.timeFrom) q.set("timeFrom", t.timeFrom);
@@ -171,7 +200,29 @@ function buildClientScript(): string {
     }
   }
 
-  async function loadFacets() {
+  function ensureSelectOption(sel, value) {
+    if (!value) return;
+    var exists = Array.prototype.some.call(sel.options, function (o) { return o.value === value; });
+    if (!exists) {
+      var o = document.createElement("option");
+      o.value = value;
+      o.textContent = value + "（当前筛选）";
+      sel.appendChild(o);
+    }
+  }
+
+  function maybeAutoLoadList() {
+    if (state.selectedAgentId.trim() || state.selectedSessionId.trim()) {
+      loadList(1);
+    } else {
+      showBanner("info", "请至少选择 agent 或 session。");
+      document.getElementById("tableWrap").innerHTML = '<p class="empty">空列表（未选择 agent / session）。</p>';
+      document.getElementById("pager").style.display = "none";
+    }
+  }
+
+  async function loadFacets(opts) {
+    var autoLoad = !opts || opts.autoLoad !== false;
     showBanner("", "");
     var r = await fetch(facetQuery());
     if (!r.ok) {
@@ -184,8 +235,7 @@ function buildClientScript(): string {
     var sessions = data.sessions || [];
     var selA = document.getElementById("agentId");
     var selS = document.getElementById("sessionId");
-    var prevA = selA.value;
-    var prevS = selS.value;
+
     selA.innerHTML = '<option value="">（请选择）</option>';
     selS.innerHTML = '<option value="">（请选择）</option>';
     agents.forEach(function (a) {
@@ -200,13 +250,19 @@ function buildClientScript(): string {
       o.textContent = s;
       selS.appendChild(o);
     });
-    if (prevA && Array.prototype.some.call(selA.options, function (o) { return o.value === prevA; })) selA.value = prevA;
-    if (prevS && Array.prototype.some.call(selS.options, function (o) { return o.value === prevS; })) selS.value = prevS;
+    ensureSelectOption(selA, state.selectedAgentId.trim());
+    ensureSelectOption(selS, state.selectedSessionId.trim());
+    selA.value = state.selectedAgentId.trim();
+    selS.value = state.selectedSessionId.trim();
+    state.selectedAgentId = selA.value.trim();
+    state.selectedSessionId = selS.value.trim();
+
+    if (autoLoad) maybeAutoLoadList();
   }
 
   async function loadList(page) {
-    var aid = document.getElementById("agentId").value.trim();
-    var sid = document.getElementById("sessionId").value.trim();
+    var aid = state.selectedAgentId.trim();
+    var sid = state.selectedSessionId.trim();
     if (!aid && !sid) {
       showBanner("info", "请至少选择 agent 或 session。");
       document.getElementById("tableWrap").innerHTML = '<p class="empty">请选择 agent 或 session 后刷新。</p>';
@@ -241,6 +297,13 @@ function buildClientScript(): string {
     }
     var rows = state.items.map(function (row, i) {
       var del = incDel ? '<td>' + esc(row.isDeleted != null ? row.isDeleted : "") + "</td>" : "";
+      var raw = row.text == null ? "" : String(row.text);
+      var long = raw.length > 200;
+      var prevCls = "text-preview" + (long ? "" : " text-preview-short");
+      var prevAttrs = long ? ' role="button" tabindex="0" title="点击展开或收起全文"' : "";
+      var hint = long
+        ? '<div class="text-hint">点击上文或此处展开全文</div>'
+        : "";
       return (
         "<tr>" +
         '<td><input type="checkbox" class="rowchk" data-i="' + i + '"/></td>' +
@@ -251,7 +314,16 @@ function buildClientScript(): string {
         "<td>" + esc(new Date(row.createdAt).toLocaleString()) + "</td>" +
         "<td>" + esc(row.importance) + "</td>" +
         del +
-        '<td><div class="text-preview">' + esc(row.text) + "</div></td>" +
+        '<td><div class="text-cell">' +
+        "<div " +
+        prevAttrs +
+        ' class="' +
+        prevCls +
+        '">' +
+        esc(row.text) +
+        "</div>" +
+        hint +
+        "</div></td>" +
         "</tr>"
       );
     }).join("");
@@ -318,7 +390,7 @@ function buildClientScript(): string {
       return;
     }
     showBanner("info", "已更新 " + (data.updated || 0) + " 条");
-    await loadFacets();
+    await loadFacets({ autoLoad: false });
     await loadList(state.page);
   }
 
@@ -335,10 +407,47 @@ function buildClientScript(): string {
   document.querySelectorAll(".tab").forEach(function (b) {
     b.onclick = function () { onTabChange(b.getAttribute("data-tab")); };
   });
+  document.getElementById("agentId").addEventListener("change", function () {
+    state.selectedAgentId = this.value.trim();
+    maybeAutoLoadList();
+  });
+  document.getElementById("sessionId").addEventListener("change", function () {
+    state.selectedSessionId = this.value.trim();
+    maybeAutoLoadList();
+  });
   document.getElementById("timePreset").onchange = function () { loadFacets(); };
   document.getElementById("includeDeleted").onchange = function () { loadFacets(); };
   document.getElementById("btnRefresh").onclick = function () { loadList(1); };
   document.getElementById("btnSoftDelete").onclick = softDelete;
+
+  function toggleTextCellPreview(cell) {
+    var prev = cell.querySelector(".text-preview");
+    if (!prev || prev.classList.contains("text-preview-short")) return;
+    prev.classList.toggle("expanded");
+    var hint = cell.querySelector(".text-hint");
+    if (hint) {
+      hint.textContent = prev.classList.contains("expanded") ? "点击上文或此处收起全文" : "点击上文或此处展开全文";
+    }
+  }
+
+  document.getElementById("tableWrap").addEventListener("click", function (e) {
+    var hint = e.target.closest && e.target.closest(".text-hint");
+    var cell = hint ? hint.closest(".text-cell") : e.target.closest && e.target.closest(".text-cell");
+    if (!cell) return;
+    if (e.target.closest && e.target.closest("input, button, a, label")) return;
+    if (hint || (e.target.closest && e.target.closest(".text-preview"))) {
+      toggleTextCellPreview(cell);
+    }
+  });
+
+  document.getElementById("tableWrap").addEventListener("keydown", function (e) {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    var prev = e.target.classList && e.target.classList.contains("text-preview") ? e.target : null;
+    if (!prev || prev.classList.contains("text-preview-short")) return;
+    e.preventDefault();
+    var cell = prev.closest(".text-cell");
+    if (cell) toggleTextCellPreview(cell);
+  });
 
   loadConfig()
     .then(function () { return loadFacets(); })

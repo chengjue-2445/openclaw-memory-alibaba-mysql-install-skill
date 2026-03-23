@@ -436,6 +436,77 @@ Use the exact "id" value from the list above for memoryId.`;
   return { action: "insert" };
 }
 
+type BatchDedupDecision = { action: "insert" } | { action: "update"; memoryId: string };
+
+/** One LLM call for multiple new memories of the same class (user_memory_* or self_improving_*). */
+async function decideBatchInsertOrUpdate(
+  llmConfig: LLMConfig,
+  cases: Array<{ newText: string; candidates: MemorySearchResult[] }>,
+): Promise<BatchDedupDecision[]> {
+  if (cases.length === 0) return [];
+  if (cases.length === 1) {
+    const d = await decideInsertOrUpdate(llmConfig, cases[0].newText, cases[0].candidates);
+    if (d.action === "insert") return [{ action: "insert" }];
+    return [{ action: "update", memoryId: d.memoryId }];
+  }
+
+  const blocks: string[] = [];
+  for (let i = 0; i < cases.length; i++) {
+    const c = cases[i];
+    const candidateList = c.candidates
+      .map((r, j) => `${j + 1}. id: ${r.entry.id}\n   text: ${r.entry.text}\n   category: ${r.entry.category}`)
+      .join("\n\n");
+    blocks.push(
+      `### Case ${i}\nNew memory text:\n"""\n${c.newText}\n"""\n\nExisting similar memories (up to 20):\n${candidateList}\n`,
+    );
+  }
+
+  const prompt = `You are a memory deduplication judge. There are ${cases.length} independent cases, indexed 0..${cases.length - 1}. For EACH case, decide whether to INSERT a new record or UPDATE one existing memory (replace with the new text).
+
+${blocks.join("\n")}
+
+Rules (apply separately to each case):
+- If the new text is semantically the same or a minor rewording of one existing memory, choose "update" with that memory's id.
+- If the new text corrects or contradicts one existing memory, choose "update" with that memory's id.
+- If the new text is a distinct fact, choose "insert".
+
+Reply with ONLY a JSON object of this exact shape:
+{"decisions":[{"action":"insert"},{"action":"update","memoryId":"<uuid>"},...]}
+The "decisions" array MUST have exactly ${cases.length} elements, in order: decisions[k] is for Case k.
+For "update", memoryId must be copied exactly from that case's existing id list.`;
+
+  const openai = new OpenAI({
+    apiKey: llmConfig.apiKey,
+    baseURL: llmConfig.baseUrl,
+  });
+  const completion = await openai.chat.completions.create({
+    model: llmConfig.model,
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0,
+  });
+  const raw = completion.choices[0]?.message?.content?.trim() ?? "";
+  try {
+    const parsed = JSON.parse(raw) as { decisions?: BatchDedupDecision[] };
+    const list = Array.isArray(parsed.decisions) ? parsed.decisions : [];
+    if (list.length !== cases.length) {
+      return cases.map(() => ({ action: "insert" as const }));
+    }
+    const out: BatchDedupDecision[] = [];
+    for (let i = 0; i < cases.length; i++) {
+      const idSet = new Set(cases[i].candidates.map((r) => r.entry.id));
+      const dec = list[i] as { action?: string; memoryId?: string };
+      if (dec?.action === "update" && typeof dec.memoryId === "string" && idSet.has(dec.memoryId)) {
+        out.push({ action: "update", memoryId: dec.memoryId });
+      } else {
+        out.push({ action: "insert" });
+      }
+    }
+    return out;
+  } catch {
+    return cases.map(() => ({ action: "insert" as const }));
+  }
+}
+
 function shouldCapture(text: string, options?: { maxChars?: number }): boolean {
   const maxChars = options?.maxChars ?? DEFAULT_CAPTURE_MAX_CHARS;
   if (text.length < 10 || text.length > maxChars) return false;
@@ -560,32 +631,13 @@ function stripInjectedContextBlocks(text: string): string {
 async function buildCaptureCandidates(
   cfg: MemoryConfig,
   userMessageTexts: string[],
-  allMessageLines: string[],
+  _allMessageLines: string[],
   userAndAssistantLines: string[],
   linesByRole: LinesByRole,
 ): Promise<CaptureCandidate[]> {
   const candidates: CaptureCandidate[] = [];
 
-  // User memory: from user messages only; strip injected blocks so we don't extract from prependContext
-  const userTextsStripped = userMessageTexts
-    .map((t) => stripInjectedContextBlocks(t))
-    .filter((t) => t && t.length > 0);
-  if (cfg.memoryExtractionMethod === "llm" && cfg.llm) {
-    const filtered = userTextsStripped.filter(
-      (t) => t.length >= 10 && t.length <= cfg.captureMaxChars,
-    );
-    const extractions = await extractUserMemoriesWithLLM(cfg.llm, filtered, MAX_AUTO_CAPTURE_LLM);
-    candidates.push(...extractions);
-  } else {
-    const toCapture = userTextsStripped.filter((t) =>
-      shouldCapture(t, { maxChars: cfg.captureMaxChars }),
-    );
-    for (const text of toCapture.slice(0, MAX_AUTO_CAPTURE_REGEX)) {
-      candidates.push({ category: detectCategory(text), text });
-    }
-  }
-
-  // Full-context by source. Strip injected blocks from user/assistant so real conversation is stored (injected context can be huge and push out the actual question).
+  // Full-context first (sync, no LLM). Previously ran after user LLM; that made captures appear "stuck" for tens of seconds.
   if (cfg.enableFullContextMemory) {
     if (linesByRole.user.length > 0) {
       const userText = linesByRole.user
@@ -637,24 +689,52 @@ async function buildCaptureCandidates(
     }
   }
 
-  // Self-improving: user + assistant only; strip injected blocks, then extract by regex or LLM
+  const userTextsStripped = userMessageTexts
+    .map((t) => stripInjectedContextBlocks(t))
+    .filter((t) => t && t.length > 0);
+
+  const llmTasks: Promise<void>[] = [];
+
+  if (cfg.memoryExtractionMethod === "llm" && cfg.llm) {
+    const filtered = userTextsStripped.filter(
+      (t) => t.length >= 10 && t.length <= cfg.captureMaxChars,
+    );
+    if (filtered.length > 0) {
+      llmTasks.push(
+        extractUserMemoriesWithLLM(cfg.llm, filtered, MAX_AUTO_CAPTURE_LLM)
+          .then((extractions) => {
+            candidates.push(...extractions);
+          })
+          .catch(() => {}),
+      );
+    }
+  } else {
+    const toCapture = userTextsStripped.filter((t) =>
+      shouldCapture(t, { maxChars: cfg.captureMaxChars }),
+    );
+    for (const text of toCapture.slice(0, MAX_AUTO_CAPTURE_REGEX)) {
+      candidates.push({ category: detectCategory(text), text });
+    }
+  }
+
   if (cfg.enableSelfImprovingMemory && userAndAssistantLines.length > 0) {
     const raw = userAndAssistantLines.join("\n");
     const fullText = stripInjectedContextBlocks(raw);
     if (fullText.length > 0) {
       if (cfg.memoryExtractionMethod === "llm" && cfg.llm) {
-        const extractions = await extractSelfImprovingWithLLM(
-          cfg.llm,
-          fullText,
-          MAX_AUTO_CAPTURE_SELF_IMPROVING,
+        llmTasks.push(
+          extractSelfImprovingWithLLM(cfg.llm, fullText, MAX_AUTO_CAPTURE_SELF_IMPROVING)
+            .then((extractions) => {
+              for (const item of extractions) {
+                candidates.push({
+                  category: item.category,
+                  text: truncateForCapture(item.text, cfg.captureMaxChars),
+                  importance: item.importance,
+                });
+              }
+            })
+            .catch(() => {}),
         );
-        for (const item of extractions) {
-          candidates.push({
-            category: item.category,
-            text: truncateForCapture(item.text, cfg.captureMaxChars),
-            importance: item.importance,
-          });
-        }
       } else {
         const extractions = extractSelfImprovingWithRegex(fullText);
         for (const item of extractions) {
@@ -667,6 +747,7 @@ async function buildCaptureCandidates(
     }
   }
 
+  if (llmTasks.length > 0) await Promise.all(llmTasks);
   return candidates;
 }
 
@@ -738,6 +819,87 @@ async function storeOneCaptureItem(
   if (decision.action === "update") await db.softDelete(agentId, decision.memoryId);
   const entry = await db.store(agentId, storePayload);
   return { action: decision.action === "update" ? "updated" : "created", entry };
+}
+
+type PreparedNonFullStore = {
+  item: CaptureCandidate;
+  vector: number[];
+  similar: MemorySearchResult[];
+};
+
+/**
+ * Store user_memory_* or self_improving_* candidates: embed+search in parallel per item;
+ * when conflict LLM is on, all cases that need a judge share ONE batch LLM call for this batch.
+ */
+async function storeNonFullContextItemsBatch(
+  agentId: string,
+  items: CaptureCandidate[],
+  cfg: MemoryConfig,
+  db: MemoryDB,
+  embeddings: Embeddings,
+  options?: { userId?: string | null; sessionId?: string | null },
+): Promise<void> {
+  if (items.length === 0) return;
+
+  if (!cfg.memory_duplication_conflict_process) {
+    for (const item of items) {
+      await storeOneCaptureItem(agentId, item, cfg, db, embeddings, options);
+    }
+    return;
+  }
+
+  const prepared: PreparedNonFullStore[] = await Promise.all(
+    items.map(async (item) => {
+      const vector = await embeddings.embed(item.text);
+      const threshold = getThresholdForCategory(cfg, item.category);
+      const dedupCategories = getDedupCategories(item.category);
+      const recallMinScore = Math.max(0.5, threshold - 0.35);
+      const similar = await db.search(agentId, vector, 20, recallMinScore, [...dedupCategories]);
+      return { item, vector, similar };
+    }),
+  );
+
+  const noConflict: PreparedNonFullStore[] = [];
+  const needJudge: PreparedNonFullStore[] = [];
+  for (const p of prepared) {
+    if (p.similar.length === 0) noConflict.push(p);
+    else needJudge.push(p);
+  }
+
+  const uid = options?.userId ?? null;
+  const sid = options?.sessionId ?? null;
+
+  for (const p of noConflict) {
+    await db.store(agentId, {
+      text: p.item.text,
+      vector: p.vector,
+      importance: p.item.importance ?? DEFAULT_IMPORTANCE,
+      category: p.item.category,
+      userId: uid,
+      sessionId: sid,
+    });
+  }
+
+  if (needJudge.length === 0) return;
+
+  const decisions = await decideBatchInsertOrUpdate(
+    cfg.llm!,
+    needJudge.map((p) => ({ newText: p.item.text, candidates: p.similar })),
+  );
+
+  for (let i = 0; i < needJudge.length; i++) {
+    const p = needJudge[i];
+    const d = decisions[i] ?? { action: "insert" as const };
+    if (d.action === "update") await db.softDelete(agentId, d.memoryId);
+    await db.store(agentId, {
+      text: p.item.text,
+      vector: p.vector,
+      importance: p.item.importance ?? DEFAULT_IMPORTANCE,
+      category: p.item.category,
+      userId: uid,
+      sessionId: sid,
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1030,13 +1192,22 @@ const memoryPlugin = {
         if (!event.prompt || event.prompt.length < 5) return;
 
         try {
+          const tRecall0 = Date.now();
           const agentId = ctx.agentId ?? "default";
+          const tEmb0 = Date.now();
           const vector = await embeddings.embed(event.prompt);
+          const embedMs = Date.now() - tEmb0;
+          const tSearch0 = Date.now();
           const results = await runRecall(db, cfg, agentId, vector, {
             limitUser: RECALL_LIMIT_USER_BEFORE_START,
             limitSelf: cfg.enableSelfImprovingMemory ? RECALL_LIMIT_SELF : 0,
             minScore: RECALL_MIN_SCORE_HOOK,
           });
+          const searchMs = Date.now() - tSearch0;
+          const totalMs = Date.now() - tRecall0;
+          api.logger.info(
+            `openclaw-memory-alibaba-local: recall timing embedMs=${embedMs} lancedbSearchMs=${searchMs} totalMs=${totalMs} results=${results.length}`,
+          );
           if (results.length === 0) return;
 
           api.logger.info(
@@ -1063,6 +1234,7 @@ const memoryPlugin = {
         if (!event.success || !event.messages || event.messages.length === 0) return;
 
         try {
+          const tCap0 = Date.now();
           const agentId = ctx.agentId ?? "default";
           const userId = (ctx as { requesterSenderId?: string }).requesterSenderId ?? null;
           const sessionId = (ctx as { sessionId?: string }).sessionId ?? (event as { sessionId?: string }).sessionId ?? null;
@@ -1078,6 +1250,8 @@ const memoryPlugin = {
               `openclaw-memory-alibaba-local: no user lines parsed; message roles: ${roles.join(", ")}`,
             );
           }
+          const tBuild0 = Date.now();
+          api.logger.info("openclaw-memory-alibaba-local: agent_end buildCaptureCandidates start");
           const toProcess = await buildCaptureCandidates(
             cfg,
             userMessageTexts,
@@ -1085,16 +1259,75 @@ const memoryPlugin = {
             userAndAssistantLines,
             linesByRole,
           );
-          if (toProcess.length === 0) return;
-
-          let stored = 0;
-          for (const item of toProcess) {
-            await storeOneCaptureItem(agentId, item, cfg, db, embeddings, { userId, sessionId });
-            stored++;
+          const buildMs = Date.now() - tBuild0;
+          api.logger.info(
+            `openclaw-memory-alibaba-local: agent_end capture candidates=${toProcess.length}`,
+          );
+          if (toProcess.length === 0) {
+            api.logger.info(
+              `openclaw-memory-alibaba-local: agent_end skip capture (0 candidates); fullContext=${cfg.enableFullContextMemory} selfImproving=${cfg.enableSelfImprovingMemory} conflictLlm=${cfg.memory_duplication_conflict_process} userLines=${linesByRole.user.length} asstLines=${linesByRole.assistant.length} strippedUserChars=${userMessageTexts.map((t) => stripInjectedContextBlocks(t)).join("").length}`,
+            );
+            api.logger.info(
+              `openclaw-memory-alibaba-local: capture timing buildCandidatesMs=${buildMs} storeWallMs=0 totalHookMs=${Date.now() - tCap0} items=0`,
+            );
+            return;
           }
+
+          const tStore0 = Date.now();
+          let storeMaxSingleMs = 0;
+
+          const fullItems = toProcess.filter((i) => isFullContextSourceCategory(i.category));
+          const otherItems = toProcess.filter((i) => !isFullContextSourceCategory(i.category));
+          const userCapItems = otherItems.filter((i) => isUserMemoryCategory(i.category));
+          const selfCapItems = otherItems.filter((i) => isSelfImprovingCategory(i.category));
+          const miscCapItems = otherItems.filter(
+            (i) => !isUserMemoryCategory(i.category) && !isSelfImprovingCategory(i.category),
+          );
+
+          async function storeOneTimed(item: CaptureCandidate): Promise<number> {
+            const tOne = Date.now();
+            await storeOneCaptureItem(agentId, item, cfg, db, embeddings, { userId, sessionId });
+            return Date.now() - tOne;
+          }
+
+          if (fullItems.length > 0) {
+            const tPar = Date.now();
+            const fullMsList = await Promise.all(fullItems.map((item) => storeOneTimed(item)));
+            const parallelWallMs = Date.now() - tPar;
+            for (const ms of fullMsList) {
+              if (ms > storeMaxSingleMs) storeMaxSingleMs = ms;
+            }
+            api.logger.info(
+              `openclaw-memory-alibaba-local: capture fullContext parallel store wallMs=${parallelWallMs} count=${fullItems.length} (embed+db overlap vs sequential sum)`,
+            );
+          }
+
+          const opt = { userId, sessionId };
+          const tUserSelf = Date.now();
+          await Promise.all([
+            storeNonFullContextItemsBatch(agentId, userCapItems, cfg, db, embeddings, opt),
+            storeNonFullContextItemsBatch(agentId, selfCapItems, cfg, db, embeddings, opt),
+          ]);
+          const userSelfWallMs = Date.now() - tUserSelf;
+          if (userCapItems.length > 0 || selfCapItems.length > 0) {
+            api.logger.info(
+              `openclaw-memory-alibaba-local: capture user/self batch parallel wallMs=${userSelfWallMs} user=${userCapItems.length} self=${selfCapItems.length} (conflict LLM batched per class when enabled)`,
+            );
+          }
+
+          for (const item of miscCapItems) {
+            const ms = await storeOneTimed(item);
+            if (ms > storeMaxSingleMs) storeMaxSingleMs = ms;
+          }
+
+          const stored = toProcess.length;
+          const storeWallMs = Date.now() - tStore0;
           if (stored > 0) {
             api.logger.info(`openclaw-memory-alibaba-local: auto-captured ${stored} memories`);
           }
+          api.logger.info(
+            `openclaw-memory-alibaba-local: capture timing buildCandidatesMs=${buildMs} storeWallMs=${storeWallMs} storeMaxSingleItemMs=${storeMaxSingleMs} totalHookMs=${Date.now() - tCap0} items=${stored} fullContext=${fullItems.length} userMem=${userCapItems.length} selfImp=${selfCapItems.length} misc=${miscCapItems.length}`,
+          );
         } catch (err) {
           api.logger.warn(`openclaw-memory-alibaba-local: capture failed: ${String(err)}`);
         }

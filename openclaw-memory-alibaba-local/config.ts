@@ -22,18 +22,21 @@ export type MemoryConfig = {
   embedding?: EmbeddingConfig;
   /** LanceDB directory; same default as OpenClaw memory-lancedb (~/.openclaw/memory/lancedb). */
   dbPath?: string;
-  /** When true, use LLM to decide insert vs update among similar memories; requires llm config. Default false. */
+  /** LLM decides insert vs update among similar memories; requires llm. Default true; set false to disable. */
   memory_duplication_conflict_process: boolean;
   /** Required when memory_duplication_conflict_process is true or memoryExtractionMethod is "llm". */
   llm?: LLMConfig;
   similarityThresholdUserMemory: number;
   similarityThresholdSelfImproving: number;
+  /** Full-context snapshots per role per session. Default true; set false to disable. */
   enableFullContextMemory: boolean;
+  /** self_improving_* capture + recall. Default true; set false to disable. */
   enableSelfImprovingMemory: boolean;
   memoryExtractionMethod: "regex" | "llm";
   autoRecall: boolean;
   autoCapture: boolean;
   captureMaxChars: number;
+  /** Recall time decay. Default true; set false to disable. */
   enableMemoryDecay: boolean;
   memoryDecayHalfLifeDays: number;
   memoryDecayStrategy: "exponential" | "linear" | "none";
@@ -221,19 +224,20 @@ export const memoryConfigSchema = {
         llm: undefined,
         similarityThresholdUserMemory: 0.65,
         similarityThresholdSelfImproving: 0.62,
-        enableFullContextMemory: false,
-        enableSelfImprovingMemory: false,
+        enableFullContextMemory: true,
+        enableSelfImprovingMemory: true,
         memoryExtractionMethod: "llm",
         autoRecall: cfg.autoRecall !== false,
         autoCapture: cfg.autoCapture !== false,
         captureMaxChars: capChars,
-        enableMemoryDecay: false,
+        enableMemoryDecay: true,
         memoryDecayHalfLifeDays: 30,
         memoryDecayStrategy: "exponential",
       };
     }
 
-    const memory_duplication_conflict_process = cfg.memory_duplication_conflict_process === true;
+    /** Default on: LLM resolves insert vs update when similar memories exist (opt out with false). */
+    const memory_duplication_conflict_process = cfg.memory_duplication_conflict_process !== false;
     const rawMethod =
       typeof cfg.memoryExtractionMethod === "string" ? cfg.memoryExtractionMethod.trim().toLowerCase() : "";
     const memoryExtractionMethod: "regex" | "llm" = rawMethod === "regex" ? "regex" : "llm";
@@ -257,8 +261,10 @@ export const memoryConfigSchema = {
       throw new Error("similarityThresholdUserMemory and similarityThresholdSelfImproving must be between 0 and 1");
     }
 
-    const enableFullContextMemory = cfg.enableFullContextMemory === true;
-    const enableSelfImprovingMemory = cfg.enableSelfImprovingMemory === true;
+    /** Default on: always persist per-role full_context_* per session when autoCapture runs (opt out with false). */
+    const enableFullContextMemory = cfg.enableFullContextMemory !== false;
+    /** Default on: self_improving_* write + recall (opt out with false). */
+    const enableSelfImprovingMemory = cfg.enableSelfImprovingMemory !== false;
 
     const captureMaxChars =
       typeof cfg.captureMaxChars === "number" ? Math.floor(cfg.captureMaxChars) : undefined;
@@ -266,7 +272,8 @@ export const memoryConfigSchema = {
       throw new Error("captureMaxChars must be between 100 and 100000");
     }
 
-    const enableMemoryDecay = cfg.enableMemoryDecay === true;
+    /** Default on: time decay on recall scores (opt out with false). */
+    const enableMemoryDecay = cfg.enableMemoryDecay !== false;
     const memoryDecayHalfLifeDays = 30;
     const memoryDecayStrategy: "exponential" | "linear" | "none" = "exponential";
 
