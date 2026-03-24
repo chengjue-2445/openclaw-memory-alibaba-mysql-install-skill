@@ -263,6 +263,18 @@ table.mem-admin-table .fm-cat-cell {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+table.mem-admin-table .fm-time-cell,
+table.mem-admin-table .fm-imp-cell,
+table.mem-admin-table th.fm-th-cat,
+table.mem-admin-table th.fm-th-time,
+table.mem-admin-table th.fm-th-imp {
+  white-space: nowrap;
+}
+table.mem-admin-table .fm-time-cell,
+table.mem-admin-table .fm-imp-cell {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 table.mem-admin-table .text-cell {
   max-width: none;
 }
@@ -272,9 +284,12 @@ table.mem-admin-table .text-preview {
 .fm-col-chk { width: 2.5rem; }
 .fm-col-agent { width: 4.25rem; }
 .fm-col-session { width: 18%; }
-.fm-col-cat { width: 10.5rem; }
-.fm-col-time { width: 9.25rem; }
-.fm-col-imp { width: 4.5rem; }
+/* 用户/自进化：类型列收窄，时间/权重列加宽，配合 nowrap 避免表头与单元格断行 */
+.fm-col-cat { width: 6.75rem; }
+/* 全文记忆「类型」：约 7 个汉字可视宽度（含间隔号等，略大于 7em） */
+.fm-col-cat-full { width: 11rem; min-width: 11rem; }
+.fm-col-time { width: 13rem; }
+.fm-col-imp { width: 6.5rem; }
 .fm-col-seq { width: 2.5rem; }
 .fm-col-text { width: auto; }
 .pager {
@@ -717,7 +732,11 @@ table.dash-top-table th {
     <label for="agentId">Agent</label>
     <select id="agentId"><option value="">（请选择）</option></select>
     <label for="sessionId">会话</label>
-    <select id="sessionId"><option value="">（请选择）</option></select>
+    <select id="sessionId"><option value="">全部</option></select>
+    <span id="memoryTypeFilterWrap">
+    <label for="memoryTypeFilter">记忆类型</label>
+    <select id="memoryTypeFilter"><option value="">全部</option></select>
+    </span>
     <span id="toolbarSortWrap">
     <label for="sortOrder">排序</label>
     <select id="sortOrder">
@@ -888,7 +907,8 @@ function buildClientScript(): string {
     selectedSessionId: "",
     sortOrderByTab: { user: "desc", self: "desc", full: "desc" },
     /** 非 null 表示当前起止时间来自「最近 N ms」快捷；刷新时先按此刻重算，避免结束时间停在旧时刻 */
-    timeQuickMs: null
+    timeQuickMs: null,
+    categoryFilterByTab: { user: "", self: "", full: "" }
   };
 
   var MS_QUICK_24H = 24 * 3600 * 1000;
@@ -992,7 +1012,7 @@ function buildClientScript(): string {
     q.set("tab", state.tab);
     var aid = state.selectedAgentId.trim();
     var sid = state.selectedSessionId.trim();
-    if (aid) q.set("agentId", aid);
+    q.set("agentId", aid);
     if (sid) q.set("sessionId", sid);
     q.set("timeFrom", t.timeFrom);
     q.set("timeTo", t.timeTo);
@@ -1001,7 +1021,42 @@ function buildClientScript(): string {
     var ord = document.getElementById("sortOrder");
     var sortDesc = ord && ord.value === "desc";
     q.set("sortDesc", sortDesc ? "true" : "false");
+    var catF = state.categoryFilterByTab[state.tab] || "";
+    if (catF) {
+      q.set("category", catF);
+    }
     return { path: "/list?" + q.toString() };
+  }
+
+  function syncMemoryTypeFilterSelect() {
+    var sel = document.getElementById("memoryTypeFilter");
+    if (!sel || !state.cfg || !state.cfg.memoryTypeFilterOptions) {
+      return;
+    }
+    if (state.tab === "dash") {
+      return;
+    }
+    var tabKey = state.tab;
+    var opts = state.cfg.memoryTypeFilterOptions[tabKey] || [];
+    var saved = state.categoryFilterByTab[tabKey] || "";
+    sel.innerHTML = "";
+    var allOpt = document.createElement("option");
+    allOpt.value = "";
+    allOpt.textContent = "全部";
+    sel.appendChild(allOpt);
+    opts.forEach(function (row) {
+      var o = document.createElement("option");
+      o.value = row.category;
+      o.textContent = row.labelZh;
+      sel.appendChild(o);
+    });
+    var ok = saved && Array.prototype.some.call(sel.options, function (opt) { return opt.value === saved; });
+    if (ok) {
+      sel.value = saved;
+    } else {
+      sel.value = "";
+      state.categoryFilterByTab[tabKey] = "";
+    }
   }
 
   function fillAddCategorySelect() {
@@ -1060,6 +1115,7 @@ function buildClientScript(): string {
       selfTab.title = "已在配置中关闭自进化记忆";
     }
     fillAddCategorySelect();
+    syncMemoryTypeFilterSelect();
   }
 
   function ensureSelectOption(sel, value) {
@@ -1074,11 +1130,11 @@ function buildClientScript(): string {
   }
 
   function maybeAutoLoadList() {
-    if (state.selectedAgentId.trim() || state.selectedSessionId.trim()) {
+    if (state.selectedAgentId.trim()) {
       loadList(1);
     } else {
-      showBanner("info", "请至少选择 Agent 或会话。");
-      document.getElementById("tableWrap").innerHTML = '<p class="empty">空列表（未选择 Agent / 会话）。</p>';
+      showBanner("info", "请先选择 Agent。");
+      document.getElementById("tableWrap").innerHTML = '<p class="empty">空列表（未选择 Agent）。</p>';
       document.getElementById("pager").style.display = "none";
     }
   }
@@ -1104,6 +1160,13 @@ function buildClientScript(): string {
     var insBtn = document.getElementById("btnInsertMemory");
     if (insBtn) {
       insBtn.style.display = isDash ? "none" : "";
+    }
+    var mtw = document.getElementById("memoryTypeFilterWrap");
+    if (mtw) {
+      mtw.style.display = isDash ? "none" : "";
+    }
+    if (!isDash) {
+      syncMemoryTypeFilterSelect();
     }
     var dashW = document.getElementById("dashWrap");
     var tblW = document.getElementById("tableWrap");
@@ -1375,16 +1438,19 @@ function buildClientScript(): string {
       document.getElementById("dashWrap").innerHTML = '<p class="dash-empty">' + esc(tr.error) + "</p>";
       return;
     }
+    var aid = state.selectedAgentId.trim();
+    if (!aid) {
+      showBanner("info", "请先选择 Agent。");
+      document.getElementById("dashWrap").innerHTML = '<p class="dash-empty">请先选择 Agent 后再查看记忆大盘。</p>';
+      return;
+    }
     showBanner("", "");
     state.loading = true;
     var q = new URLSearchParams();
     q.set("timeFrom", tr.timeFrom);
     q.set("timeTo", tr.timeTo);
-    var aid = state.selectedAgentId.trim();
+    q.set("agentId", aid);
     var sid = state.selectedSessionId.trim();
-    if (aid) {
-      q.set("agentId", aid);
-    }
     if (sid) {
       q.set("sessionId", sid);
     }
@@ -1424,7 +1490,7 @@ function buildClientScript(): string {
     var selS = document.getElementById("sessionId");
 
     selA.innerHTML = '<option value="">（请选择）</option>';
-    selS.innerHTML = '<option value="">（请选择）</option>';
+    selS.innerHTML = '<option value="">全部</option>';
     agents.forEach(function (a) {
       var o = document.createElement("option");
       o.value = a;
@@ -1465,10 +1531,9 @@ function buildClientScript(): string {
       return;
     }
     var aid = state.selectedAgentId.trim();
-    var sid = state.selectedSessionId.trim();
-    if (!aid && !sid) {
-      showBanner("info", "请至少选择 Agent 或会话。");
-      document.getElementById("tableWrap").innerHTML = '<p class="empty">请选择 Agent 或会话后刷新。</p>';
+    if (!aid) {
+      showBanner("info", "请先选择 Agent。");
+      document.getElementById("tableWrap").innerHTML = '<p class="empty">请选择 Agent 后刷新。</p>';
       document.getElementById("pager").style.display = "none";
       return;
     }
@@ -1651,8 +1716,8 @@ function buildClientScript(): string {
       catTdOpen +
       esc(categoryLabel(row.category)) +
       "</td>" +
-      "<td>" + esc(new Date(row.createdAt).toLocaleString()) + "</td>" +
-      (extraCols ? "" : "<td>" + esc(row.importance) + "</td>") +
+      '<td class="fm-time-cell">' + esc(new Date(row.createdAt).toLocaleString()) + "</td>" +
+      (extraCols ? "" : '<td class="fm-imp-cell mono">' + esc(row.importance) + "</td>") +
       seqCell +
       textTd +
       "</tr>"
@@ -1681,7 +1746,7 @@ function buildClientScript(): string {
         '<col class="fm-col-chk"/>' +
         '<col class="fm-col-agent"/>' +
         '<col class="fm-col-session"/>' +
-        '<col class="fm-col-cat"/>' +
+        '<col class="fm-col-cat-full"/>' +
         '<col class="fm-col-time"/>' +
         '<col class="fm-col-seq"/>' +
         '<col class="fm-col-text"/>' +
@@ -1689,7 +1754,7 @@ function buildClientScript(): string {
       var thead =
         "<thead><tr>" +
         '<th><input type="checkbox" class="batch-chk-all" title="本对话轮次全选"/></th>' +
-        "<th>Agent</th><th>会话</th><th>类型</th><th>时间</th><th>序</th><th>正文</th></tr></thead>";
+        "<th>Agent</th><th>会话</th><th class='fm-th-cat fm-th-cat-full'>类型</th><th class='fm-th-time'>时间</th><th>序</th><th>正文</th></tr></thead>";
       var blocks = groups.map(function (g) {
         var label = g.batchId
           ? "对话轮次 · " + esc(g.batchId.slice(0, 8)) + "… · " + g.rows.length + " 条（组内正序）"
@@ -1731,7 +1796,7 @@ function buildClientScript(): string {
         listColgroup +
         "<thead><tr>" +
         '<th><input type="checkbox" id="chkAll"/></th>' +
-        "<th>Agent</th><th>会话</th><th>记忆类型</th><th>记忆时间</th><th>记忆权重</th><th>正文</th></tr></thead><tbody>" +
+        "<th>Agent</th><th>会话</th><th class='fm-th-cat'>记忆类型</th><th class='fm-th-time'>记忆时间</th><th class='fm-th-imp'>记忆权重</th><th>正文</th></tr></thead><tbody>" +
         rows +
         "</tbody></table>";
     }
@@ -1917,6 +1982,13 @@ function buildClientScript(): string {
   document.getElementById("sessionId").addEventListener("change", function () {
     state.selectedSessionId = this.value.trim();
     maybeAutoLoadForCurrentTab();
+  });
+  document.getElementById("memoryTypeFilter").addEventListener("change", function () {
+    if (state.tab === "dash") {
+      return;
+    }
+    state.categoryFilterByTab[state.tab] = this.value.trim();
+    loadList(1);
   });
   function onTimeFilterChange() {
     showBanner("", "");

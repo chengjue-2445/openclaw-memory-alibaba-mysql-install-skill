@@ -4,10 +4,10 @@
  * Long-term memory with vector search (LanceDB). User memory is subdivided into
  * user_memory_fact / user_memory_preference / user_memory_decision.
  * Uses before_prompt_build (recall); auto-capture on agent_end only: per-role cursors,
- * full_context_* embed+write (batchId for collapsible UI), then parallel user-memory vs self-improving pipelines.
+ * full_context_* plain write with zero-vector placeholder (no embed; batchId for UI), then parallel user-memory vs self-improving pipelines.
  */
 
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import OpenAI from "openai";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
@@ -41,6 +41,7 @@ import {
   type MemoryConfig,
   type LLMConfig,
 } from "./config.js";
+import { scoreDocumentsBm25 } from "./bm25-recall.js";
 import { splitTextIntoEmbeddingChunks } from "./embed-chunks.js";
 import { createEmbeddingBackend, type EmbeddingBackend } from "./embedding-backend.js";
 import {
@@ -58,18 +59,27 @@ import {
   buildUserMemoryExtractionPrompt,
   SELF_IMPROVING_EXTRACTION_INSTRUCTIONS,
 } from "./prompts.js";
+import { extractUserQueryForRecall, stripForLogicalMemoryExtraction } from "./prompt-strip.js";
 
 // ---------------------------------------------------------------------------
 // Constants (recall limits, etc.)
 // ---------------------------------------------------------------------------
 
-const RECALL_LIMIT_USER_DEFAULT = 80;
-const RECALL_LIMIT_USER_BEFORE_START = 80;
-const RECALL_LIMIT_SELF = 30;
-const RECALL_LIMIT_TOTAL = 100;
+/** 向量合并排序后最多保留条数 */
+const RECALL_VECTOR_MAX = 21;
+/** BM25 补充条数上限（与向量结果去重后） */
+const RECALL_BM25_MAX = 9;
+/** 向量 + BM25 合并后最终上限 */
+const RECALL_FINAL_MAX = 30;
+/** BM25 扫描的最大行数（性能上限） */
+const RECALL_BM25_CORPUS_MAX = 5000;
+const RECALL_LIMIT_USER_BEFORE_START = RECALL_VECTOR_MAX;
+const RECALL_LIMIT_SELF = RECALL_VECTOR_MAX;
+/** memory_forget 向量检索候选池；memory_recall 默认 limit 上限参照 */
+const RECALL_LIMIT_USER_DEFAULT = RECALL_FINAL_MAX;
 const RECALL_MIN_SCORE_STRICT = 0.7;
-const RECALL_MIN_SCORE_RELAXED = 0.1;
-const RECALL_MIN_SCORE_HOOK = 0.3;
+const RECALL_MIN_SCORE_RELAXED = 0.6;
+const RECALL_MIN_SCORE_HOOK = 0.6;
 const DECAY_FETCH_MULTIPLIER = 3;
 const MAX_AUTO_CAPTURE_REGEX = 3;
 const MAX_AUTO_CAPTURE_LLM = 5;
@@ -186,7 +196,12 @@ function applyMemoryDecay(
   return withDecay.sort((a, b) => b.score - a.score);
 }
 
-/** Run vector recall for user + optional self-improving memories; optionally apply time decay, sort by importance, cap total. */
+function recallCombinedRank(r: MemorySearchResult): number {
+  const imp = r.entry.importance ?? 0;
+  return r.score * 0.7 + imp * 0.3;
+}
+
+/** 向量召回：可选时间衰减后按 0.7*score+0.3*importance 排序，最多 {@link RECALL_VECTOR_MAX} 条（再由 BM25 补充至 {@link RECALL_FINAL_MAX}）。 */
 async function runRecall(
   db: MemoryDB,
   cfg: MemoryConfig,
@@ -227,16 +242,102 @@ async function runRecall(
       cfg.memoryDecayHalfLifeDays,
     );
   }
-  // Sort by importance (desc) then score (desc), then cap total
   results = results
-    .sort((a, b) => {
-      const impA = a.entry.importance ?? 0;
-      const impB = b.entry.importance ?? 0;
-      if (impB !== impA) return impB - impA;
-      return b.score - a.score;
-    })
-    .slice(0, RECALL_LIMIT_TOTAL);
+    .sort((a, b) => recallCombinedRank(b) - recallCombinedRank(a))
+    .slice(0, RECALL_VECTOR_MAX);
   return results;
+}
+
+async function bm25SupplementRecall(
+  db: MemoryDB,
+  cfg: MemoryConfig,
+  agentId: string,
+  queryText: string,
+  vectorResults: MemorySearchResult[],
+  maxAdd: number,
+): Promise<MemorySearchResult[]> {
+  const q = queryText.trim();
+  if (q.length < 2 || maxAdd <= 0) {
+    return [];
+  }
+  const cats: MemoryCategory[] = [...USER_MEMORY_CATEGORIES];
+  if (cfg.enableSelfImprovingMemory) {
+    cats.push(...SELF_IMPROVING_CATEGORIES);
+  }
+  const rows = await db.listRowsForBm25Recall(agentId, cats, RECALL_BM25_CORPUS_MAX);
+  if (rows.length === 0) {
+    return [];
+  }
+  const scored = scoreDocumentsBm25(
+    q,
+    rows.map((r) => ({ id: r.id, text: r.text })),
+  );
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const seenId = new Set(vectorResults.map((r) => r.entry.id));
+  const seenKey = new Set(vectorResults.map((r) => `${r.entry.category}\0${r.entry.text}`));
+  const maxS = scored.find((x) => x.score > 0)?.score ?? 0;
+  const pool: MemorySearchResult[] = [];
+  for (const { id, score } of scored) {
+    const entry = byId.get(id);
+    if (!entry || seenId.has(id)) {
+      continue;
+    }
+    const key = `${entry.category}\0${entry.text}`;
+    if (seenKey.has(key)) {
+      continue;
+    }
+    const norm = maxS > 0 ? Math.min(1, score / maxS) : 0;
+    if (norm <= 0) {
+      continue;
+    }
+    pool.push({ entry, score: norm });
+    if (pool.length >= 300) {
+      break;
+    }
+  }
+  if (pool.length === 0) {
+    return [];
+  }
+  let ranked = pool;
+  if (cfg.enableMemoryDecay) {
+    ranked = applyMemoryDecay(ranked, Date.now(), cfg.memoryDecayStrategy, cfg.memoryDecayHalfLifeDays);
+  }
+  ranked.sort((a, b) => {
+    const ia = a.entry.importance ?? 0;
+    const ib = b.entry.importance ?? 0;
+    if (ib !== ia) {
+      return ib - ia;
+    }
+    return b.score - a.score;
+  });
+  const out: MemorySearchResult[] = [];
+  for (const r of ranked) {
+    if (out.length >= maxAdd) {
+      break;
+    }
+    if (seenId.has(r.entry.id)) {
+      continue;
+    }
+    seenId.add(r.entry.id);
+    out.push(r);
+  }
+  return out;
+}
+
+async function runHybridRecall(
+  db: MemoryDB,
+  cfg: MemoryConfig,
+  agentId: string,
+  queryText: string,
+  queryVectors: number[][],
+  options: { limitUser: number; limitSelf: number; minScore: number },
+): Promise<MemorySearchResult[]> {
+  const vector = await runRecall(db, cfg, agentId, queryVectors, options);
+  const extra =
+    queryText.trim().length >= 2
+      ? await bm25SupplementRecall(db, cfg, agentId, queryText, vector, RECALL_BM25_MAX)
+      : [];
+  return [...vector, ...extra].slice(0, RECALL_FINAL_MAX);
 }
 
 /** One item to be stored in auto-capture or by tool (category + text + optional importance). */
@@ -599,53 +700,9 @@ function truncateForCapture(text: string, maxChars: number): string {
   return text.slice(0, maxChars) + "...";
 }
 
-/** Matches OpenClaw `buildInboundMetadataBlocks` (control-ui / channels): ```json ... ``` after a labeled line. */
-const OPENCLAW_UNTRUSTED_METADATA_BLOCK_RE = new RegExp(
-  "(?:^|[\\r\\n])(?:Conversation info|Sender|Thread starter|Replied message|Forwarded message context|Chat history since last reply)\\s*\\([^)]*\\):\\s*" +
-    "```" +
-    "(?:json)?\\s*[\\s\\S]*?" +
-    "```" +
-    "\\s*",
-  "gim",
-);
-
-/**
- * Strip prompt/channel noise before user_memory / self_improving extraction only.
- * Full-context rows intentionally keep the raw transcript (including XML + OpenClaw metadata).
- */
-function stripForLogicalMemoryExtraction(text: string): string {
-  let out = text
-    .replace(/<\s*relevant-memories\b[\s\S]*?<\s*\/\s*relevant-memories\s*>/gi, "\n")
-    .replace(/<\s*knowledge-context\b[\s\S]*?<\s*\/\s*knowledge-context\s*>/gi, "\n");
-
-  let prev: string;
-  do {
-    prev = out;
-    out = out.replace(OPENCLAW_UNTRUSTED_METADATA_BLOCK_RE, "\n");
-  } while (out !== prev);
-
-  // Envelope timestamp before visible text, e.g. [Tue 2026-03-24 22:35 GMT+8]
-  out = out.replace(/^\s*\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b[^[\]]*\]\s+/im, "");
-
-  out = out.replace(/\n{3,}/g, "\n\n").replace(/^\n+|\n+$/g, "").trim();
-  return out;
-}
-
 /** @deprecated alias — extraction-only; do not use for full_context_* snapshot text. */
 function stripInjectedContextBlocks(text: string): string {
   return stripForLogicalMemoryExtraction(text);
-}
-
-function sha256Hex(s: string): string {
-  return createHash("sha256").update(s, "utf8").digest("hex");
-}
-
-function messageContentFingerprint(sessionKey: string, role: string, canonicalText: string): string {
-  return sha256Hex(`${sessionKey}\0${role}\0${canonicalText}`);
-}
-
-function memoryRowFingerprint(sessionKey: string, category: string, text: string): string {
-  return sha256Hex(`${sessionKey}\0${category}\0${text}`);
 }
 
 /** Align agentId for capture, recall, and tools when ctx.agentId is missing (OpenClaw default agent is `main`). */
@@ -685,6 +742,24 @@ function resolveStorageSessionKey(ctx: { sessionKey?: string; sessionId?: string
   return (ctx.sessionKey ?? "").trim();
 }
 
+/** full_context_* (and legacy full_context_memory): no real embedding; LanceDB row uses zero vector placeholder. */
+function isFullContextStoredWithoutEmbedding(category: MemoryCategory): boolean {
+  return category === FULL_CONTEXT_MEMORY || isFullContextSourceCategory(category);
+}
+
+function zeroPlaceholderEmbedding(vectorDim: number): number[] {
+  return Array.from({ length: vectorDim }, () => 0);
+}
+
+/** Categories that participate in embedding-based recall / memory_forget-by-query (excludes full_context_*). */
+function categoriesForVectorRecall(cfg: MemoryConfig): MemoryCategory[] {
+  const out: MemoryCategory[] = [...USER_MEMORY_CATEGORIES];
+  if (cfg.enableSelfImprovingMemory) {
+    out.push(...SELF_IMPROVING_CATEGORIES);
+  }
+  return out;
+}
+
 function roleToFullContextCategory(role: string): MemoryCategory {
   if (role === "user") return FULL_CONTEXT_USER;
   if (role === "assistant") return FULL_CONTEXT_ASSISTANT;
@@ -702,7 +777,7 @@ type DeltaFullContextRow = {
 };
 
 /**
- * agent_end: per-role cursors → delta rows by source → embed + LanceDB for full_context_* (shared batchId);
+ * agent_end: per-role cursors → delta rows by source → LanceDB for full_context_* (shared batchId, no embed / no dedup);
  * then Promise.all(user-memory pipeline on user deltas, self-improving on user+assistant deltas).
  */
 async function runAgentEndCapture(
@@ -786,28 +861,19 @@ async function runAgentEndCapture(
   const batchId = randomUUID();
   const sid = sessionKey;
 
-  for (const row of fullRows) {
-    const fp = messageContentFingerprint(sessionKey, row.roleLabel, row.text);
-    if (await db.existsByContentHash(agentId, sid, fp)) {
-      continue;
-    }
-    const { vectors } = await backend.encodeForStorage(row.text);
-    if (vectors.length === 0) {
-      continue;
-    }
+  if (fullRows.length > 0) {
     await db.storeMany(
       agentId,
-      vectors.map((vector, idx) => ({
+      fullRows.map((row) => ({
         text: row.text,
-        vector,
+        vector: zeroPlaceholderEmbedding(backend.vectorDim),
         importance: DEFAULT_IMPORTANCE,
         category: row.category,
         userId: null,
         sessionId: sid,
         batchId,
         seqInBatch: row.seqInBatch,
-        contentHash: fp,
-        chunkIndex: idx,
+        chunkIndex: 0,
       })),
     );
   }
@@ -866,14 +932,12 @@ async function captureUserMemoryFromInboundTexts(
 
   for (const item of candidates) {
     const text = truncateForCapture(item.text, cfg.captureMaxChars);
-    const fp = memoryRowFingerprint(sessionKey, item.category, text);
-    if (await db.existsByContentHash(agentId, sessionKey, fp)) {
+    if (await db.existsSemanticDuplicate(agentId, sessionKey, item.category, text)) {
       continue;
     }
     await storeOneCaptureItem(agentId, { ...item, text }, cfg, db, backend, {
       userId,
       sessionId: sessionKey,
-      contentHash: fp,
     });
   }
 }
@@ -925,14 +989,12 @@ async function captureSelfImprovingFromLines(
   }
 
   for (const item of candidates) {
-    const fp = memoryRowFingerprint(sessionKey, item.category, item.text);
-    if (await db.existsByContentHash(agentId, sessionKey, fp)) {
+    if (await db.existsSemanticDuplicate(agentId, sessionKey, item.category, item.text)) {
       continue;
     }
     await storeOneCaptureItem(agentId, item, cfg, db, backend, {
       userId,
       sessionId: sessionKey,
-      contentHash: fp,
     });
   }
 }
@@ -956,7 +1018,6 @@ function buildChunkRows(
   options?: {
     userId?: string | null;
     sessionId?: string | null;
-    contentHash?: string | null;
     batchId?: string | null;
     seqInBatch?: number | null;
   },
@@ -967,7 +1028,6 @@ function buildChunkRows(
   category: MemoryCategory;
   userId?: string | null;
   sessionId?: string | null;
-  contentHash?: string | null;
   batchId?: string | null;
   seqInBatch?: number | null;
   chunkIndex?: number | null;
@@ -984,7 +1044,6 @@ function buildChunkRows(
     category: item.category,
     userId: options?.userId ?? null,
     sessionId: options?.sessionId ?? null,
-    contentHash: options?.contentHash ?? null,
     batchId: options?.batchId ?? null,
     seqInBatch,
     chunkIndex: idx,
@@ -997,10 +1056,8 @@ async function deleteSimilarLogicalMemory(
   sessionId: string | null | undefined,
   hit: MemorySearchResult,
 ): Promise<void> {
-  const hash = hit.entry.contentHash;
-  if (hash && hash.length > 0) {
-    await db.deleteByContentHash(agentId, sessionId, hash);
-  } else {
+  const n = await db.deleteByAgentSessionCategoryText(agentId, sessionId, hit.entry.category, hit.entry.text);
+  if (n === 0) {
     await db.delete(agentId, hit.entry.id);
   }
 }
@@ -1014,11 +1071,18 @@ async function storeOneCaptureItem(
   options?: {
     userId?: string | null;
     sessionId?: string | null;
-    contentHash?: string | null;
     batchId?: string | null;
     seqInBatch?: number | null;
   },
 ): Promise<StoreOneResult> {
+  if (isFullContextStoredWithoutEmbedding(item.category)) {
+    const rows = buildChunkRows(item, [zeroPlaceholderEmbedding(backend.vectorDim)], {
+      ...options,
+    });
+    const stored = await db.storeMany(agentId, rows);
+    return { action: "created", entry: stored[0]! };
+  }
+
   const { vectors } = await backend.encodeForStorage(item.text);
   if (vectors.length === 0) {
     throw new Error("openclaw-memory-alibaba-local: encodeForStorage returned no vectors");
@@ -1026,11 +1090,6 @@ async function storeOneCaptureItem(
   const threshold = getThresholdForCategory(cfg, item.category);
   const dedupCategories = getDedupCategories(item.category);
   const rows = buildChunkRows(item, vectors, options);
-
-  if (isFullContextSourceCategory(item.category)) {
-    const stored = await db.storeMany(agentId, rows);
-    return { action: "created", entry: stored[0]! };
-  }
 
   if (!cfg.memory_duplication_conflict_process) {
     const similar = await db.searchMerged(agentId, vectors, 1, threshold, [...dedupCategories]);
@@ -1191,8 +1250,11 @@ const memoryPlugin = {
         backend
           ? {
               encodeForStorage: (text) => backend!.encodeForStorage(text),
+              vectorDim: db.getEmbeddingVectorDim(),
             }
-          : undefined,
+          : {
+              vectorDim: db.getEmbeddingVectorDim(),
+            },
       );
     } else {
       api.logger.warn("openclaw-memory-alibaba-local: registerHttpRoute missing — /plugins/memory UI disabled");
@@ -1227,11 +1289,10 @@ const memoryPlugin = {
           const { query, limit = RECALL_LIMIT_USER_DEFAULT } = params as { query: string; limit?: number };
           const agentId = resolveAgentIdForMemory(ctx);
           const queryVectors = await embedQueryVectors(backend, query);
-          const limitUser = Math.max(1, limit);
-          const limitSelf = cfg.enableSelfImprovingMemory
-            ? Math.max(1, Math.min(RECALL_LIMIT_SELF, limit))
-            : 0;
-          const results = await runRecall(db, cfg, agentId, queryVectors, {
+          const capped = Math.max(1, Math.min(RECALL_VECTOR_MAX, limit));
+          const limitUser = capped;
+          const limitSelf = cfg.enableSelfImprovingMemory ? capped : 0;
+          const results = await runHybridRecall(db, cfg, agentId, query, queryVectors, {
             limitUser,
             limitSelf,
             minScore: RECALL_MIN_SCORE_RELAXED,
@@ -1398,8 +1459,9 @@ const memoryPlugin = {
             const results = await db.searchMerged(
               agentId,
               queryVectors,
-              RECALL_LIMIT_USER_DEFAULT,
+              RECALL_FINAL_MAX,
               RECALL_MIN_SCORE_STRICT,
+              categoriesForVectorRecall(cfg),
             );
             if (results.length === 0) {
               return {
@@ -1409,17 +1471,15 @@ const memoryPlugin = {
             }
             if (results.length === 1 && results[0]!.score > 0.9) {
               const r = results[0]!.entry;
-              if (r.contentHash && r.contentHash.length > 0) {
-                const n = await db.deleteByContentHash(agentId, r.sessionId, r.contentHash);
-                return {
-                  content: [{ type: "text", text: `Forgotten: "${r.text}"` }],
-                  details: { action: "deleted", rows: n, id: r.id },
-                };
-              }
-              await db.delete(agentId, r.id);
+              const n = await db.deleteByAgentSessionCategoryText(
+                agentId,
+                r.sessionId,
+                r.category,
+                r.text,
+              );
               return {
                 content: [{ type: "text", text: `Forgotten: "${r.text}"` }],
-                details: { action: "deleted", id: r.id },
+                details: { action: "deleted", rows: n, id: r.id },
               };
             }
             const list = results
@@ -1461,13 +1521,29 @@ const memoryPlugin = {
         if (!event.prompt || event.prompt.length < 5) return;
 
         try {
+          const extracted = extractUserQueryForRecall(event.prompt);
+          if (extracted.query.length < 5) {
+            api.logger.info(
+              `openclaw-memory-alibaba-local: recall skip (extracted query too short) rawLen=${event.prompt.length} queryLen=${extracted.query.length} removed=${extracted.removedLabels.join(",") || "none"}`,
+            );
+            return;
+          }
+
+          const preview =
+            extracted.query.length > 160
+              ? `${extracted.query.slice(0, 160)}…`
+              : extracted.query;
+          api.logger.info(
+            `openclaw-memory-alibaba-local: recallQueryExtract rawLen=${event.prompt.length} queryLen=${extracted.query.length} fallback=${extracted.usedFallback} removed=${extracted.removedLabels.join(",") || "none"} preview=${JSON.stringify(preview)}`,
+          );
+
           const tRecall0 = Date.now();
           const agentId = resolveAgentIdForMemory(ctx);
           const tEmb0 = Date.now();
-          const queryVectors = await embedQueryVectors(backend, event.prompt);
+          const queryVectors = await embedQueryVectors(backend, extracted.query);
           const embedMs = Date.now() - tEmb0;
           const tSearch0 = Date.now();
-          const results = await runRecall(db, cfg, agentId, queryVectors, {
+          const results = await runHybridRecall(db, cfg, agentId, extracted.query, queryVectors, {
             limitUser: RECALL_LIMIT_USER_BEFORE_START,
             limitSelf: cfg.enableSelfImprovingMemory ? RECALL_LIMIT_SELF : 0,
             minScore: RECALL_MIN_SCORE_HOOK,
@@ -1475,7 +1551,7 @@ const memoryPlugin = {
           const searchMs = Date.now() - tSearch0;
           const totalMs = Date.now() - tRecall0;
           api.logger.info(
-            `openclaw-memory-alibaba-local: recall timing embedMs=${embedMs} lancedbSearchMs=${searchMs} totalMs=${totalMs} results=${results.length}`,
+            `openclaw-memory-alibaba-local: recall timing embedMs=${embedMs} lancedbSearchMs=${searchMs} totalMs=${totalMs} results=${results.length} (vector≤${RECALL_VECTOR_MAX}+bm25≤${RECALL_BM25_MAX}, cap ${RECALL_FINAL_MAX})`,
           );
           if (results.length === 0) return;
 

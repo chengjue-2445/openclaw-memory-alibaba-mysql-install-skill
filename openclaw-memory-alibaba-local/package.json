@@ -18,6 +18,7 @@
   ],
   "files": [
     "index.ts",
+    "prompt-strip.ts",
     "capture-state.ts",
     "config.ts",
     "db.ts",

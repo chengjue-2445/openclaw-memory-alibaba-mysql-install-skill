@@ -2,7 +2,14 @@ import fs from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { MemoryCategory } from "./categories.js";
-import { ALL_CATEGORIES, USER_MEMORY_FACT } from "./categories.js";
+import {
+  ALL_CATEGORIES,
+  FULL_CONTEXT_SOURCE_CATEGORIES,
+  MEMORY_CATEGORY_LABEL_ZH,
+  SELF_IMPROVING_CATEGORIES,
+  USER_MEMORY_CATEGORIES,
+  USER_MEMORY_FACT,
+} from "./categories.js";
 
 /** OpenAI-compatible HTTP embeddings; all fields required — invalid/empty values fail on first embed, not at startup. */
 export type EmbeddingConfigRemote = {
@@ -30,6 +37,104 @@ export type LLMConfig = {
   baseUrl?: string;
 };
 
+/** 管理端列表「记忆类型」筛选项（category + 展示用中文名）；可由插件配置覆盖。 */
+export type AdminPanelMemoryTypeOption = {
+  category: MemoryCategory;
+  labelZh: string;
+};
+
+export type AdminPanelMemoryTypeOptionsResolved = {
+  user: AdminPanelMemoryTypeOption[];
+  self: AdminPanelMemoryTypeOption[];
+  full: AdminPanelMemoryTypeOption[];
+};
+
+const ADMIN_PANEL_TAB_KEYS = ["user", "self", "full"] as const;
+
+const USER_MEMORY_CAT_SET = new Set<string>(USER_MEMORY_CATEGORIES);
+const SELF_MEMORY_CAT_SET = new Set<string>(SELF_IMPROVING_CATEGORIES);
+const FULL_SOURCE_CAT_SET = new Set<string>(FULL_CONTEXT_SOURCE_CATEGORIES);
+
+function defaultAdminPanelMemoryTypeOptions(
+  enableFullContextMemory: boolean,
+  enableSelfImprovingMemory: boolean,
+): AdminPanelMemoryTypeOptionsResolved {
+  return {
+    user: USER_MEMORY_CATEGORIES.map((c) => ({ category: c, labelZh: MEMORY_CATEGORY_LABEL_ZH[c] })),
+    self: enableSelfImprovingMemory
+      ? SELF_IMPROVING_CATEGORIES.map((c) => ({ category: c, labelZh: MEMORY_CATEGORY_LABEL_ZH[c] }))
+      : [],
+    full: enableFullContextMemory
+      ? FULL_CONTEXT_SOURCE_CATEGORIES.map((c) => ({ category: c, labelZh: MEMORY_CATEGORY_LABEL_ZH[c] }))
+      : [],
+  };
+}
+
+function parseAdminPanelMemoryTypeOptions(
+  raw: unknown,
+  enableFullContextMemory: boolean,
+  enableSelfImprovingMemory: boolean,
+): AdminPanelMemoryTypeOptionsResolved {
+  const defaults = defaultAdminPanelMemoryTypeOptions(
+    enableFullContextMemory,
+    enableSelfImprovingMemory,
+  );
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return defaults;
+  }
+  const o = raw as Record<string, unknown>;
+  assertAllowedKeys(o, [...ADMIN_PANEL_TAB_KEYS], "adminPanelMemoryTypeOptions");
+
+  const out: AdminPanelMemoryTypeOptionsResolved = {
+    user: defaults.user,
+    self: defaults.self,
+    full: defaults.full,
+  };
+
+  for (const key of ADMIN_PANEL_TAB_KEYS) {
+    if (!(key in o)) {
+      continue;
+    }
+    const arr = o[key];
+    if (arr == null) {
+      continue;
+    }
+    if (!Array.isArray(arr)) {
+      throw new Error(`adminPanelMemoryTypeOptions.${key} must be an array`);
+    }
+    const allowed =
+      key === "user" ? USER_MEMORY_CAT_SET : key === "self" ? SELF_MEMORY_CAT_SET : FULL_SOURCE_CAT_SET;
+    if (key === "self" && !enableSelfImprovingMemory && arr.length > 0) {
+      throw new Error("adminPanelMemoryTypeOptions.self: enableSelfImprovingMemory is false");
+    }
+    if (key === "full" && !enableFullContextMemory && arr.length > 0) {
+      throw new Error("adminPanelMemoryTypeOptions.full: enableFullContextMemory is false");
+    }
+    const parsed: AdminPanelMemoryTypeOption[] = [];
+    for (const item of arr) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        throw new Error(`adminPanelMemoryTypeOptions.${key}: invalid entry`);
+      }
+      const rec = item as Record<string, unknown>;
+      assertAllowedKeys(rec, ["category", "labelZh"], `adminPanelMemoryTypeOptions.${key}[]`);
+      const cat = pickNonEmptyString(rec.category);
+      const labelZh = pickNonEmptyString(rec.labelZh);
+      if (!cat || !labelZh) {
+        throw new Error(`adminPanelMemoryTypeOptions.${key}: category and labelZh must be non-empty strings`);
+      }
+      if (!ALL_CATEGORIES.includes(cat as MemoryCategory)) {
+        throw new Error(`adminPanelMemoryTypeOptions.${key}: unknown category "${cat}"`);
+      }
+      if (!allowed.has(cat)) {
+        throw new Error(`adminPanelMemoryTypeOptions.${key}: category "${cat}" is not valid for tab "${key}"`);
+      }
+      parsed.push({ category: cat as MemoryCategory, labelZh });
+    }
+    out[key] = parsed;
+  }
+  return out;
+}
+
 export type MemoryConfig = {
   /** Omitted when plugin is loaded without embedding (e.g. npm install); required at runtime for memory ops. */
   embedding?: EmbeddingConfig;
@@ -53,6 +158,8 @@ export type MemoryConfig = {
   enableMemoryDecay: boolean;
   memoryDecayHalfLifeDays: number;
   memoryDecayStrategy: "exponential" | "linear" | "none";
+  /** 管理端各 Tab「记忆类型」筛选项（缺省为内置类别 + 中文名） */
+  adminPanelMemoryTypeOptions: AdminPanelMemoryTypeOptionsResolved;
 };
 
 /** Re-export for tools and DB (user_memory_* + full_context + self_improving_*) */
@@ -375,6 +482,7 @@ export const memoryConfigSchema = {
         "enableMemoryDecay",
         "memoryDecayHalfLifeDays",
         "memoryDecayStrategy",
+        "adminPanelMemoryTypeOptions",
       ],
       "memory config",
     );
@@ -434,6 +542,12 @@ export const memoryConfigSchema = {
     const memoryDecayStrategy: "exponential" | "linear" | "none" =
       decayRaw === "linear" ? "linear" : decayRaw === "none" ? "none" : "exponential";
 
+    const adminPanelMemoryTypeOptions = parseAdminPanelMemoryTypeOptions(
+      cfg.adminPanelMemoryTypeOptions,
+      enableFullContextMemory,
+      enableSelfImprovingMemory,
+    );
+
     return {
       embedding: parseEmbeddingConfig(cfg.embedding),
       dbPath,
@@ -450,6 +564,7 @@ export const memoryConfigSchema = {
       enableMemoryDecay,
       memoryDecayHalfLifeDays,
       memoryDecayStrategy,
+      adminPanelMemoryTypeOptions,
     };
   },
 };

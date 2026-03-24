@@ -10,6 +10,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { MemoryCategory, MemoryConfig } from "../config.js";
 import {
   FULL_CONTEXT_ASSISTANT,
+  FULL_CONTEXT_MEMORY,
   FULL_CONTEXT_OTHERS,
   FULL_CONTEXT_SOURCE_CATEGORIES,
   FULL_CONTEXT_SYSTEM,
@@ -20,6 +21,7 @@ import {
   MEMORY_CATEGORY_LABEL_ZH,
   SELF_IMPROVING_CATEGORIES,
   USER_MEMORY_CATEGORIES,
+  isFullContextSourceCategory,
 } from "../categories.js";
 import type { MemoryDB } from "../db.js";
 import type { AdminListFilters } from "../db.js";
@@ -28,9 +30,15 @@ import { getMemoryPanelHtml } from "./memory-ui.js";
 const MANUAL_ADD_MAX_CHARS = 8000;
 
 export type MemoryPanelRoutesOpts = {
-  /** Required for POST /api/add (embedding). */
+  /** Required for POST /api/add when category needs real embeddings (user / self-improving). */
   encodeForStorage?: (text: string) => Promise<{ chunks: string[]; vectors: number[][] }>;
+  /** LanceDB vector width; used for full_context_* manual add (zero placeholder, no embed). */
+  vectorDim?: number;
 };
+
+function categoryUsesRealEmbedding(category: MemoryCategory): boolean {
+  return category !== FULL_CONTEXT_MEMORY && !isFullContextSourceCategory(category);
+}
 
 function writableCategoriesForPanel(cfg: MemoryConfig): MemoryCategory[] {
   const out: MemoryCategory[] = [...USER_MEMORY_CATEGORIES];
@@ -60,6 +68,8 @@ function buildPanelConfigPayload(cfg: MemoryConfig) {
       self: cfg.enableSelfImprovingMemory ? [...SELF_IMPROVING_CATEGORIES] : [],
       full: cfg.enableFullContextMemory ? [...FULL_CONTEXT_SOURCE_CATEGORIES] : [],
     },
+    /** 各 Tab 列表「记忆类型」筛选项（来自插件配置 + 默认中文名） */
+    memoryTypeFilterOptions: cfg.adminPanelMemoryTypeOptions,
   };
 }
 
@@ -225,6 +235,10 @@ export function registerMemoryPanelRoutes(
           }
           const agentId = (url.searchParams.get("agentId") ?? "").trim();
           const sessionId = (url.searchParams.get("sessionId") ?? "").trim();
+          if (!agentId) {
+            sendJson(res, 400, { error: "缺少 agentId：请先选择 Agent" });
+            return true;
+          }
           try {
             const agg = await db.getAdminDashboardAggregates(timeFromMs, timeToMs, agentId, sessionId);
             sendJson(res, 200, agg);
@@ -238,12 +252,12 @@ export function registerMemoryPanelRoutes(
           const tab = url.searchParams.get("tab") || "user";
           const agentId = (url.searchParams.get("agentId") ?? "").trim();
           const sessionId = (url.searchParams.get("sessionId") ?? "").trim();
-          if (!agentId && !sessionId) {
-            sendJson(res, 400, { error: "agentId or sessionId required" });
+          if (!agentId) {
+            sendJson(res, 400, { error: "缺少 agentId：请先选择 Agent" });
             return true;
           }
-          const cats = tabToCategories(tab, cfg);
-          if (cats.length === 0) {
+          const baseCats = tabToCategories(tab, cfg);
+          if (baseCats.length === 0) {
             sendJson(res, 200, { items: [], total: 0, page: 1, pageSize: 100 });
             return true;
           }
@@ -252,14 +266,28 @@ export function registerMemoryPanelRoutes(
           const page = Math.max(1, parseInt(url.searchParams.get("page") || "1", 10) || 1);
           const pageSize = Math.min(500, Math.max(1, parseInt(url.searchParams.get("limit") || "100", 10) || 100));
 
+          const categoryOne = (url.searchParams.get("category") ?? "").trim();
+          let filterCats = baseCats;
+          if (categoryOne) {
+            if (!baseCats.includes(categoryOne as MemoryCategory)) {
+              sendJson(res, 400, { error: "category 与当前 Tab 不匹配" });
+              return true;
+            }
+            const listTab = tab === "full" ? "full" : tab === "self" ? "self" : "user";
+            const optList = cfg.adminPanelMemoryTypeOptions[listTab];
+            if (!optList.some((o) => o.category === categoryOne)) {
+              sendJson(res, 400, { error: "category 不在插件配置的记忆类型筛选项中" });
+              return true;
+            }
+            filterCats = [categoryOne as MemoryCategory];
+          }
+
           const filters: AdminListFilters = {
-            categories: cats,
+            categories: filterCats,
             timeFromMs,
             timeToMs,
           };
-          if (agentId) {
-            filters.agentId = agentId;
-          }
+          filters.agentId = agentId;
           if (sessionId) {
             filters.sessionId = sessionId;
           }
@@ -308,13 +336,10 @@ export function registerMemoryPanelRoutes(
           return true;
         }
 
-        // Manual insert: embed once + db.store only. Skips storeOneCaptureItem, vector dedup, and conflict LLM.
+        // Manual insert: embed for user/self rows; full_context_* uses zero-vector placeholder (no embed).
         if (p === "/plugins/memory/api/add" && req.method === "POST") {
           const enc = opts?.encodeForStorage;
-          if (!enc) {
-            sendJson(res, 503, { error: "Embedding not configured; plugin needs embedding in config." });
-            return true;
-          }
+          const vectorDim = typeof opts?.vectorDim === "number" && opts.vectorDim > 0 ? opts.vectorDim : 768;
           const raw = await readBody(req);
           let body: { agentId?: string; text?: string; category?: string };
           try {
@@ -341,17 +366,26 @@ export function registerMemoryPanelRoutes(
             return true;
           }
           const textForEmbed = text.length > MANUAL_ADD_MAX_CHARS ? text.slice(0, MANUAL_ADD_MAX_CHARS) : text;
-          let vectors: number[][];
-          try {
-            const out = await enc(textForEmbed);
-            vectors = out.vectors;
-          } catch (e) {
-            sendJson(res, 502, { error: `embed failed: ${String(e)}` });
+          const needsRealEmbed = categoryUsesRealEmbedding(category);
+          if (needsRealEmbed && !enc) {
+            sendJson(res, 503, { error: "Embedding not configured; plugin needs embedding in config." });
             return true;
           }
-          if (vectors.length === 0) {
-            sendJson(res, 400, { error: "nothing to embed (empty after chunking)" });
-            return true;
+          let vectors: number[][];
+          if (needsRealEmbed) {
+            try {
+              const out = await enc!(textForEmbed);
+              vectors = out.vectors;
+            } catch (e) {
+              sendJson(res, 502, { error: `embed failed: ${String(e)}` });
+              return true;
+            }
+            if (vectors.length === 0) {
+              sendJson(res, 400, { error: "nothing to embed (empty after chunking)" });
+              return true;
+            }
+          } else {
+            vectors = [Array.from({ length: vectorDim }, () => 0)];
           }
           const stored = await db.storeMany(
             agentId,

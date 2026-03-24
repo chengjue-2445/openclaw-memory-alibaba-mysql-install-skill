@@ -48,7 +48,7 @@
       "enableFullContextMemory": {
         "type": "boolean",
         "default": true,
-        "description": "When true (default), append full_context_* rows per message on agent_end (incremental cursor). Not used in vector recall."
+        "description": "When true (default), append full_context_* rows on agent_end (incremental cursor). Stored as plain text with a zero vector placeholder (no embedding); not used in vector recall."
       },
       "enableSelfImprovingMemory": {
         "type": "boolean",
@@ -78,6 +78,49 @@
         "type": "string",
         "enum": ["exponential", "linear", "none"],
         "default": "exponential"
+      },
+      "adminPanelMemoryTypeOptions": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "管理端「用户记忆 / 自进化记忆 / 全文记忆」Tab 的「记忆类型」筛选项；可写 category + 中文 labelZh。省略则使用内置类别与中文名。",
+        "properties": {
+          "user": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["category", "labelZh"],
+              "properties": {
+                "category": { "type": "string" },
+                "labelZh": { "type": "string" }
+              }
+            }
+          },
+          "self": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["category", "labelZh"],
+              "properties": {
+                "category": { "type": "string" },
+                "labelZh": { "type": "string" }
+              }
+            }
+          },
+          "full": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["category", "labelZh"],
+              "properties": {
+                "category": { "type": "string" },
+                "labelZh": { "type": "string" }
+              }
+            }
+          }
+        }
       }
     }
   },
@@ -150,7 +193,7 @@
     },
     "enableFullContextMemory": {
       "label": "Enable Full Context Memory",
-      "help": "Default on: append one row per transcript message on agent_end (batchId + cursor). Not injected into recall."
+      "help": "Default on: one row per new transcript message on agent_end (batchId + cursor). No embedding/dedup; zero-vector placeholder only. Not injected into recall."
     },
     "enableSelfImprovingMemory": {
       "label": "Enable Self-Improving Memory",
@@ -176,6 +219,10 @@
     "enableMemoryDecay": {
       "label": "Enable Memory Decay",
       "help": "Default on: older memories score lower on recall. Turn off for flat scores."
+    },
+    "adminPanelMemoryTypeOptions": {
+      "label": "管理端记忆类型筛选项",
+      "help": "可选。按 Tab 配置 { user|self|full: [{ category, labelZh }] }；category 须为该 Tab 合法类别，labelZh 为下拉展示中文。不写则用内置列表与中文名。"
     }
   }
 }

@@ -7,7 +7,7 @@ OpenClaw 记忆插件：**本地 LanceDB** 向量存储。支持用户记忆三�
 
 **Embedding** 支持 **`local`**（默认，本机 `llama-embedding` 从 **stdin** 读入文本）与 **`remote`**（OpenAI 兼容 `/v1/embeddings`）。**LLM** 仍可用 DashScope 兼容接口。相似度与官方 **memory-lancedb** 一致：`score = 1 / (1 + L2_distance)`。
 
-**长文本**：按**空行分段**；每段用 **约 `maxToken` 个 token（字数/4）** 为上限，超长段再切分。每段单独算向量并**单独占一行**（不向量化合并）；召回时对查询各段分别搜向量，再按 **`contentHash` 合并**取最高分。
+**长文本**：按**空行分段**；每段用 **约 `maxToken` 个 token（字数/4）** 为上限，超长段再切分。每段单独算向量并**单独占一行**（不向量化合并）；召回时对查询各段分别搜向量，再按 **`category` + 正文** 合并取最高分。
 
 ## 与官方 memory-lancedb 共用目录时的表名
 

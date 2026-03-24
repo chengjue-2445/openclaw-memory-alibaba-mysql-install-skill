@@ -21,8 +21,6 @@ export type MemoryEntry = {
   /** agent_end batch grouping for full-context rows */
   batchId?: string;
   seqInBatch?: number;
-  /** Dedup / idempotency (sha256 hex) */
-  contentHash?: string;
   /** 同一逻辑记忆多向量行时的段序号（0..n-1）；与 seqInBatch 配合排序 */
   chunkIndex?: number;
 };
@@ -80,7 +78,6 @@ function rowToEntry(row: Record<string, unknown>, fallbackAgentId?: string): Mem
   const seqRaw = row.seqInBatch;
   const seqInBatch =
     typeof seqRaw === "number" && Number.isFinite(seqRaw) ? Math.floor(seqRaw) : undefined;
-  const ch = row.contentHash != null && String(row.contentHash).length > 0 ? String(row.contentHash) : undefined;
   const ciRaw = row.chunkIndex;
   const chunkIndex =
     typeof ciRaw === "number" && Number.isFinite(ciRaw) ? Math.floor(ciRaw) : undefined;
@@ -95,7 +92,6 @@ function rowToEntry(row: Record<string, unknown>, fallbackAgentId?: string): Mem
     isDeleted: isDel !== undefined && isDel !== null ? Number(isDel) : undefined,
     batchId,
     seqInBatch,
-    contentHash: ch,
     chunkIndex,
   };
 }
@@ -300,6 +296,11 @@ export class MemoryDB {
     private readonly dbPath: string,
     private readonly vectorDim: number,
   ) {}
+
+  /** LanceDB `vector` column width; used for full_context rows stored without real embeddings (zero placeholder). */
+  getEmbeddingVectorDim(): number {
+    return this.vectorDim;
+  }
 
   private async ensureInitialized(): Promise<void> {
     if (this.table) {
@@ -560,7 +561,6 @@ export class MemoryDB {
         "text",
         "batchId",
         "seqInBatch",
-        "contentHash",
         "chunkIndex",
       ])
       .toArray();
@@ -585,6 +585,29 @@ export class MemoryDB {
    * Pass **categories = []** to scan all non-deleted rows (recommended for facets: legacy `full_context_memory`, unknown categories).
    * Non-empty categories adds `category IN (...)`.
    */
+  /**
+   * 拉取可供 BM25 打分的行（用户/自进化逻辑记忆），条数上限避免全表扫描过大。
+   * 按 createdAt 新→旧排序。
+   */
+  async listRowsForBm25Recall(
+    agentId: string,
+    categories: MemoryCategory[],
+    maxRows: number,
+  ): Promise<MemoryEntry[]> {
+    if (categories.length === 0) {
+      return [];
+    }
+    await this.ensureInitialized();
+    const a = sqlEscapeLiteral(agentId);
+    const list = categories.map((c) => `'${sqlEscapeLiteral(String(c))}'`).join(", ");
+    const where = `id != '${sqlEscapeLiteral(BOOTSTRAP_ROW_ID)}' AND agentId = '${a}' AND isDeleted = 0 AND category IN (${list})`;
+    const cap = Math.max(1, Math.min(maxRows, 50_000));
+    const rows = await this.table!.query().where(where).limit(cap).toArray();
+    const entries = (rows as Array<Record<string, unknown>>).map((r) => rowToEntry(r, agentId));
+    entries.sort((a, b) => b.createdAt - a.createdAt);
+    return entries;
+  }
+
   async listAdminFacets(
     categories: MemoryCategory[],
     timeFromMs?: number,
@@ -632,7 +655,6 @@ export class MemoryDB {
       sessionId?: string | null;
       batchId?: string | null;
       seqInBatch?: number | null;
-      contentHash?: string | null;
       chunkIndex?: number | null;
     },
   ): Promise<MemoryEntry> {
@@ -655,7 +677,6 @@ export class MemoryDB {
       sessionId?: string | null;
       batchId?: string | null;
       seqInBatch?: number | null;
-      contentHash?: string | null;
       chunkIndex?: number | null;
     }>,
   ): Promise<MemoryEntry[]> {
@@ -675,8 +696,6 @@ export class MemoryDB {
         typeof entry.seqInBatch === "number" && Number.isFinite(entry.seqInBatch)
           ? Math.floor(entry.seqInBatch)
           : 0;
-      const contentHash =
-        entry.contentHash != null && String(entry.contentHash).trim() ? String(entry.contentHash).trim() : "";
       const chunkIndex =
         typeof entry.chunkIndex === "number" && Number.isFinite(entry.chunkIndex)
           ? Math.floor(entry.chunkIndex)
@@ -694,7 +713,7 @@ export class MemoryDB {
         isDeleted: 0,
         batchId,
         seqInBatch,
-        contentHash,
+        contentHash: "",
         chunkIndex,
       });
       out.push({
@@ -706,7 +725,6 @@ export class MemoryDB {
         createdAt,
         batchId: batchId || undefined,
         seqInBatch,
-        contentHash: contentHash || undefined,
         chunkIndex,
       });
     }
@@ -714,23 +732,29 @@ export class MemoryDB {
     return out;
   }
 
-  /** Skip duplicate hook/agent_end writes for the same session + hash. */
-  async existsByContentHash(agentId: string, sessionId: string, contentHash: string): Promise<boolean> {
-    const h = (contentHash ?? "").trim();
-    if (!h) {
+  /** 是否已有相同 agent + session + category + 全文 的非删除行（用于自动捕获前跳过完全重复）。 */
+  async existsSemanticDuplicate(
+    agentId: string,
+    sessionId: string,
+    category: MemoryCategory,
+    text: string,
+  ): Promise<boolean> {
+    const t = (text ?? "").trim();
+    if (!t) {
       return false;
     }
     await this.ensureInitialized();
     const a = sqlEscapeLiteral(agentId);
     const s = sqlEscapeLiteral(normSessionId(sessionId));
-    const hh = sqlEscapeLiteral(h);
-    const where = `agentId = '${a}' AND sessionId = '${s}' AND contentHash = '${hh}' AND isDeleted = 0`;
+    const c = sqlEscapeLiteral(String(category));
+    const tt = sqlEscapeLiteral(t);
+    const where = `agentId = '${a}' AND sessionId = '${s}' AND category = '${c}' AND text = '${tt}' AND isDeleted = 0`;
     const rows = await this.table!.query().where(where).limit(1).toArray();
     return rows.length > 0;
   }
 
   /**
-   * Vector search with multiple query embeddings; merge by logical key (contentHash if set, else row id), keep max score.
+   * Vector search with multiple query embeddings; merge by category + text (chunk 行共享同一逻辑正文), keep max score.
    */
   async searchMerged(
     agentId: string,
@@ -747,10 +771,7 @@ export class MemoryDB {
     for (const v of vectors) {
       const hits = await this.search(agentId, v, perVec, minScore, categories);
       for (const h of hits) {
-        const key =
-          h.entry.contentHash && String(h.entry.contentHash).length > 0
-            ? String(h.entry.contentHash)
-            : h.entry.id;
+        const key = `${String(h.entry.category)}\0${h.entry.text}`;
         const prev = merged.get(key);
         if (!prev || h.score > prev.score) {
           merged.set(key, h);
@@ -807,21 +828,23 @@ export class MemoryDB {
     return n;
   }
 
-  /** Delete all rows for the same logical memory (same agent, session, contentHash). */
-  async deleteByContentHash(
+  /** 删除同一逻辑记忆的所有 chunk 行（agent + session + category + 正文完全一致）。 */
+  async deleteByAgentSessionCategoryText(
     agentId: string,
     sessionId: string | null | undefined,
-    contentHash: string,
+    category: MemoryCategory,
+    text: string,
   ): Promise<number> {
-    const h = (contentHash ?? "").trim();
-    if (!h) {
+    const t = (text ?? "").trim();
+    if (!t) {
       return 0;
     }
     await this.ensureInitialized();
     const a = sqlEscapeLiteral(agentId);
     const s = sqlEscapeLiteral(normSessionId(sessionId));
-    const hh = sqlEscapeLiteral(h);
-    const pred = `agentId = '${a}' AND sessionId = '${s}' AND contentHash = '${hh}'`;
+    const c = sqlEscapeLiteral(String(category));
+    const tt = sqlEscapeLiteral(t);
+    const pred = `agentId = '${a}' AND sessionId = '${s}' AND category = '${c}' AND text = '${tt}'`;
     const res = await this.table!.delete(pred);
     return res.numDeletedRows ?? 0;
   }
