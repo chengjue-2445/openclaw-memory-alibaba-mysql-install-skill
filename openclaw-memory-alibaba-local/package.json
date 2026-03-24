@@ -18,8 +18,11 @@
   ],
   "files": [
     "index.ts",
+    "capture-state.ts",
     "config.ts",
     "db.ts",
+    "embed-chunks.ts",
+    "embedding-backend.ts",
     "categories.ts",
     "prompts.ts",
     "web/memory-routes.ts",

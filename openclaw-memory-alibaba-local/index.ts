@@ -3,9 +3,11 @@
  *
  * Long-term memory with vector search (LanceDB). User memory is subdivided into
  * user_memory_fact / user_memory_preference / user_memory_decision.
- * Uses before_agent_start (recall) and agent_end (auto-capture) hooks.
+ * Uses before_prompt_build (recall); auto-capture on agent_end only: per-role cursors,
+ * full_context_* embed+write (batchId for collapsible UI), then parallel user-memory vs self-improving pipelines.
  */
 
+import { createHash, randomUUID } from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import OpenAI from "openai";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
@@ -35,11 +37,20 @@ import {
 import {
   DEFAULT_CAPTURE_MAX_CHARS,
   memoryConfigSchema,
-  vectorDimsForModel,
-  modelSupportsFlexDimensions,
+  embeddingVectorDim,
   type MemoryConfig,
   type LLMConfig,
 } from "./config.js";
+import { splitTextIntoEmbeddingChunks } from "./embed-chunks.js";
+import { createEmbeddingBackend, type EmbeddingBackend } from "./embedding-backend.js";
+import {
+  getFullContextCursorKey,
+  loadAgentEndCursorMap,
+  normalizeRoleForCursor,
+  parseAgentIdFromSessionKey,
+  resolveRoleCountsForSession,
+  saveAgentEndCursorMap,
+} from "./capture-state.js";
 import { LANCEDB_TABLE_NAME, MemoryDB } from "./db.js";
 import { registerMemoryPanelRoutes } from "./web/memory-routes.js";
 import type { MemoryEntry, MemorySearchResult } from "./db.js";
@@ -64,35 +75,16 @@ const MAX_AUTO_CAPTURE_REGEX = 3;
 const MAX_AUTO_CAPTURE_LLM = 5;
 const DEFAULT_IMPORTANCE = 0.7;
 
-// ---------------------------------------------------------------------------
-// Embeddings (OpenAI SDK — compatible with DashScope via baseUrl)
-// ---------------------------------------------------------------------------
-
-class Embeddings {
-  private client: OpenAI;
-  private sendDimensions: boolean;
-
-  constructor(
-    apiKey: string,
-    private model: string,
-    baseUrl?: string,
-    private dimensions?: number,
-  ) {
-    this.client = new OpenAI({ apiKey, baseURL: baseUrl });
-    this.sendDimensions = modelSupportsFlexDimensions(model);
+async function embedQueryVectors(backend: EmbeddingBackend, text: string): Promise<number[][]> {
+  const t = text.trim();
+  if (!t) {
+    return [];
   }
-
-  async embed(text: string): Promise<number[]> {
-    const params: { model: string; input: string; dimensions?: number } = {
-      model: this.model,
-      input: text,
-    };
-    if (this.sendDimensions && this.dimensions) {
-      params.dimensions = this.dimensions;
-    }
-    const response = await this.client.embeddings.create(params);
-    return response.data[0].embedding;
+  const chunks = splitTextIntoEmbeddingChunks(t, backend.maxToken);
+  if (chunks.length === 0) {
+    return [];
   }
+  return backend.embedTexts(chunks);
 }
 
 // ---------------------------------------------------------------------------
@@ -139,12 +131,23 @@ function escapeMemoryForPrompt(text: string): string {
 }
 
 function formatRelevantMemoriesContext(
-  memories: Array<{ category: MemoryCategory; text: string; createdAt: number }>,
+  memories: Array<{
+    category: MemoryCategory;
+    text: string;
+    createdAt: number;
+    importance: number;
+  }>,
 ): string {
   const formatTs = (ts: number) => new Date(ts).toISOString();
+  const formatImp = (v: number) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return "0";
+    const s = n.toFixed(4).replace(/\.?0+$/, "");
+    return s.length ? s : "0";
+  };
   const lines = memories.map(
     (entry, i) =>
-      `${i + 1}. [${entry.category}] ${formatTs(entry.createdAt)} ${escapeMemoryForPrompt(entry.text)}`,
+      `${i + 1}. [${entry.category}] [importance=${formatImp(entry.importance)}] ${formatTs(entry.createdAt)} ${escapeMemoryForPrompt(entry.text)}`,
   );
   return [
     "<relevant-memories>",
@@ -188,24 +191,27 @@ async function runRecall(
   db: MemoryDB,
   cfg: MemoryConfig,
   agentId: string,
-  vector: number[],
+  queryVectors: number[][],
   options: { limitUser: number; limitSelf: number; minScore: number },
 ): Promise<MemorySearchResult[]> {
+  if (queryVectors.length === 0) {
+    return [];
+  }
   const { limitUser, limitSelf, minScore } = options;
   const fetchMultiplier = cfg.enableMemoryDecay ? DECAY_FETCH_MULTIPLIER : 1;
 
-  const resultsUser = await db.search(
+  const resultsUser = await db.searchMerged(
     agentId,
-    vector,
+    queryVectors,
     limitUser * fetchMultiplier,
     minScore,
     [...USER_MEMORY_CATEGORIES],
   );
   const resultsSelf =
     limitSelf > 0 && cfg.enableSelfImprovingMemory
-      ? await db.search(
+      ? await db.searchMerged(
           agentId,
-          vector,
+          queryVectors,
           limitSelf * fetchMultiplier,
           minScore,
           [...SELF_IMPROVING_CATEGORIES],
@@ -535,76 +541,56 @@ function detectCategory(text: string): UserMemoryCategory {
 // Message parsing and capture candidate building (for agent_end)
 // ---------------------------------------------------------------------------
 
+const MAX_TOOL_ARGS_JSON_CHARS = 8000;
+
+/** One content block from pi-ai / OpenClaw transcript → capturable text (thinking, toolCall, text, …). */
+function blockToCaptureString(block: Record<string, unknown>): string | null {
+  const t = typeof block.type === "string" ? block.type : "";
+  if (t === "text" && typeof block.text === "string") {
+    return block.text;
+  }
+  if (t === "thinking" && typeof block.thinking === "string") {
+    return block.thinking;
+  }
+  if (t === "toolCall" && typeof block.name === "string") {
+    let argsStr = "";
+    try {
+      const a = block.arguments;
+      argsStr = a !== undefined && a !== null && typeof a === "object" ? JSON.stringify(a) : String(a ?? "");
+    } catch {
+      argsStr = "[unserializable arguments]";
+    }
+    if (argsStr.length > MAX_TOOL_ARGS_JSON_CHARS) {
+      argsStr = argsStr.slice(0, MAX_TOOL_ARGS_JSON_CHARS) + "…";
+    }
+    const id = typeof block.id === "string" ? block.id : "";
+    return `[toolCall${id ? ` id=${id}` : ""}] ${block.name} ${argsStr}`.trim();
+  }
+  if (t === "image") {
+    return "[image]";
+  }
+  return null;
+}
+
 function getTextPartsFromMessage(msg: Record<string, unknown>): string[] {
   const content = msg.content;
-  if (typeof content === "string") return content ? [content] : [];
-  if (!Array.isArray(content)) return [];
+  if (typeof content === "string") {
+    return content ? [content] : [];
+  }
+  if (!Array.isArray(content)) {
+    return [];
+  }
   const parts: string[] = [];
   for (const block of content) {
-    if (
-      block &&
-      typeof block === "object" &&
-      "type" in block &&
-      (block as Record<string, unknown>).type === "text" &&
-      "text" in block &&
-      typeof (block as Record<string, unknown>).text === "string"
-    ) {
-      parts.push((block as Record<string, unknown>).text as string);
+    if (!block || typeof block !== "object") {
+      continue;
+    }
+    const s = blockToCaptureString(block as Record<string, unknown>);
+    if (s) {
+      parts.push(s);
     }
   }
   return parts;
-}
-
-/** Lines by role for full-context (user / assistant / system / tool / tool_result / others). */
-export type LinesByRole = {
-  user: string[];
-  assistant: string[];
-  system: string[];
-  tool: string[];
-  tool_result: string[];
-  others: string[];
-};
-
-/** From raw agent messages, collect user-only texts, full/conversation lines, and lines grouped by role. */
-function parseMessagesForCapture(messages: unknown[]): {
-  userMessageTexts: string[];
-  allMessageLines: string[];
-  userAndAssistantLines: string[];
-  linesByRole: LinesByRole;
-} {
-  const userMessageTexts: string[] = [];
-  const allMessageLines: string[] = [];
-  const userAndAssistantLines: string[] = [];
-  const linesByRole: LinesByRole = {
-    user: [],
-    assistant: [],
-    system: [],
-    tool: [],
-    tool_result: [],
-    others: [],
-  };
-
-  for (const msg of messages) {
-    if (!msg || typeof msg !== "object") continue;
-    const m = msg as Record<string, unknown>;
-    const role = (typeof m.role === "string" ? m.role : "unknown") as string;
-    const parts = getTextPartsFromMessage(m);
-    if (parts.length === 0) continue;
-
-    const line = `[${role}] ${parts.join(" ")}`;
-    allMessageLines.push(line);
-    if (role !== "system") userAndAssistantLines.push(line);
-    if (role === "user") userMessageTexts.push(...parts);
-
-    if (role === "user") linesByRole.user.push(line);
-    else if (role === "assistant") linesByRole.assistant.push(line);
-    else if (role === "system") linesByRole.system.push(line);
-    else if (role === "tool") linesByRole.tool.push(line);
-    else if (role === "toolResult" || role === "tool_result") linesByRole.tool_result.push(line);
-    else linesByRole.others.push(line);
-  }
-
-  return { userMessageTexts, allMessageLines, userAndAssistantLines, linesByRole };
 }
 
 /** Truncate to max chars and append "..." if needed. */
@@ -613,142 +599,342 @@ function truncateForCapture(text: string, maxChars: number): string {
   return text.slice(0, maxChars) + "...";
 }
 
+/** Matches OpenClaw `buildInboundMetadataBlocks` (control-ui / channels): ```json ... ``` after a labeled line. */
+const OPENCLAW_UNTRUSTED_METADATA_BLOCK_RE = new RegExp(
+  "(?:^|[\\r\\n])(?:Conversation info|Sender|Thread starter|Replied message|Forwarded message context|Chat history since last reply)\\s*\\([^)]*\\):\\s*" +
+    "```" +
+    "(?:json)?\\s*[\\s\\S]*?" +
+    "```" +
+    "\\s*",
+  "gim",
+);
+
 /**
- * Strip injected context blocks from conversation text so we don't store
- * prependContext (relevant-memories, knowledge-context) as part of self_improving / full_context.
- * The first user message in event.messages often contains these blocks; without stripping,
- * they would be saved verbatim and bloat the stored memory.
+ * Strip prompt/channel noise before user_memory / self_improving extraction only.
+ * Full-context rows intentionally keep the raw transcript (including XML + OpenClaw metadata).
  */
-function stripInjectedContextBlocks(text: string): string {
+function stripForLogicalMemoryExtraction(text: string): string {
   let out = text
     .replace(/<\s*relevant-memories\b[\s\S]*?<\s*\/\s*relevant-memories\s*>/gi, "\n")
     .replace(/<\s*knowledge-context\b[\s\S]*?<\s*\/\s*knowledge-context\s*>/gi, "\n");
+
+  let prev: string;
+  do {
+    prev = out;
+    out = out.replace(OPENCLAW_UNTRUSTED_METADATA_BLOCK_RE, "\n");
+  } while (out !== prev);
+
+  // Envelope timestamp before visible text, e.g. [Tue 2026-03-24 22:35 GMT+8]
+  out = out.replace(/^\s*\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b[^[\]]*\]\s+/im, "");
+
   out = out.replace(/\n{3,}/g, "\n\n").replace(/^\n+|\n+$/g, "").trim();
   return out;
 }
 
-/** Build list of capture candidates: user (regex/LLM) + optional full-context by source + optional self-improving. */
-async function buildCaptureCandidates(
-  cfg: MemoryConfig,
-  userMessageTexts: string[],
-  _allMessageLines: string[],
-  userAndAssistantLines: string[],
-  linesByRole: LinesByRole,
-): Promise<CaptureCandidate[]> {
-  const candidates: CaptureCandidate[] = [];
+/** @deprecated alias — extraction-only; do not use for full_context_* snapshot text. */
+function stripInjectedContextBlocks(text: string): string {
+  return stripForLogicalMemoryExtraction(text);
+}
 
-  // Full-context first (sync, no LLM). Previously ran after user LLM; that made captures appear "stuck" for tens of seconds.
-  if (cfg.enableFullContextMemory) {
-    if (linesByRole.user.length > 0) {
-      const userText = linesByRole.user
-        .map((line) => stripInjectedContextBlocks(line))
-        .filter((s) => s.length > 0)
-        .join("\n");
-      if (userText.length > 0) {
-        candidates.push({
-          category: FULL_CONTEXT_USER,
-          text: truncateForCapture(userText, cfg.captureMaxChars),
-        });
+function sha256Hex(s: string): string {
+  return createHash("sha256").update(s, "utf8").digest("hex");
+}
+
+function messageContentFingerprint(sessionKey: string, role: string, canonicalText: string): string {
+  return sha256Hex(`${sessionKey}\0${role}\0${canonicalText}`);
+}
+
+function memoryRowFingerprint(sessionKey: string, category: string, text: string): string {
+  return sha256Hex(`${sessionKey}\0${category}\0${text}`);
+}
+
+/** Align agentId for capture, recall, and tools when ctx.agentId is missing (OpenClaw default agent is `main`). */
+function resolveAgentIdForMemory(ctx: {
+  agentId?: string;
+  sessionKey?: string;
+  sessionId?: string;
+}): string {
+  const fromCtx = (ctx.agentId ?? "").trim();
+  if (fromCtx) {
+    return fromCtx;
+  }
+  let sk = (ctx.sessionKey ?? "").trim();
+  if (!sk && (ctx.sessionId ?? "").trim()) {
+    sk = `session:${(ctx.sessionId ?? "").trim()}`;
+  }
+  if (sk) {
+    return parseAgentIdFromSessionKey(sk);
+  }
+  return "main";
+}
+
+/**
+ * LanceDB `sessionId` 列、全文游标与去重指纹使用的「存储会话键」。
+ * Gateway 里主对话的 `sessionKey` 常为固定 `agent:main:main`，但每条对话有独立 `sessionId`；
+ * 若优先用 sessionKey，新开会话的记忆仍会写入同一栏。只要存在 `sessionId` 就用 `session:<id>`（已与 `session:` 前缀则不再重复加）。
+ */
+function resolveStorageSessionKey(ctx: { sessionKey?: string; sessionId?: string }): string {
+  const sid = (ctx.sessionId ?? "").trim();
+  if (sid) {
+    const lower = sid.toLowerCase();
+    if (lower.startsWith("session:")) {
+      return sid;
+    }
+    return `session:${sid}`;
+  }
+  return (ctx.sessionKey ?? "").trim();
+}
+
+function roleToFullContextCategory(role: string): MemoryCategory {
+  if (role === "user") return FULL_CONTEXT_USER;
+  if (role === "assistant") return FULL_CONTEXT_ASSISTANT;
+  if (role === "system" || role === "developer") return FULL_CONTEXT_SYSTEM;
+  if (role === "tool") return FULL_CONTEXT_TOOL;
+  if (role === "toolResult" || role === "tool_result") return FULL_CONTEXT_TOOL_RESULT;
+  return FULL_CONTEXT_OTHERS;
+}
+
+type DeltaFullContextRow = {
+  roleLabel: string;
+  text: string;
+  category: MemoryCategory;
+  seqInBatch: number;
+};
+
+/**
+ * agent_end: per-role cursors → delta rows by source → embed + LanceDB for full_context_* (shared batchId);
+ * then Promise.all(user-memory pipeline on user deltas, self-improving on user+assistant deltas).
+ */
+async function runAgentEndCapture(
+  cfg: MemoryConfig,
+  db: MemoryDB,
+  backend: EmbeddingBackend,
+  agentId: string,
+  sessionKey: string,
+  userId: string | null,
+  messages: unknown[],
+  lancedbDir: string,
+  log: { info: (m: string) => void; warn: (m: string) => void },
+): Promise<void> {
+  if (messages.length === 0) {
+    return;
+  }
+
+  const key = getFullContextCursorKey(agentId, sessionKey);
+  const map = loadAgentEndCursorMap(lancedbDir);
+  const entry = map[key];
+  let { roleCounts: saved, lastMessagesLength } = resolveRoleCountsForSession(entry, messages, log);
+
+  if (messages.length < lastMessagesLength) {
+    log.info("openclaw-memory-alibaba-local: transcript shrank; reset per-role capture cursors");
+    saved = {};
+  }
+
+  const running: Record<string, number> = { ...saved };
+  const fullRows: DeltaFullContextRow[] = [];
+  const userRawTexts: string[] = [];
+  const uaLines: string[] = [];
+  let seqFull = 0;
+
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") {
+      continue;
+    }
+    const m = msg as Record<string, unknown>;
+    const roleRaw = typeof m.role === "string" ? m.role : "unknown";
+    const roleKey = normalizeRoleForCursor(roleRaw);
+    running[roleKey] = (running[roleKey] ?? 0) + 1;
+    const n = running[roleKey]!;
+    const prevSaved = saved[roleKey] ?? 0;
+    if (n <= prevSaved) {
+      continue;
+    }
+
+    const parts = getTextPartsFromMessage(m);
+    const body = parts.join(" ").trim();
+    const hasParts = parts.length > 0 && body.length > 0;
+    const category = roleToFullContextCategory(roleRaw);
+    // 全文记忆：与 transcript 一致，不剥 XML / OpenClaw metadata。
+    const lineFull = `[${roleRaw}] ${body}`;
+    const textFull = truncateForCapture(lineFull.trim() ? lineFull : `[${roleRaw}]`, cfg.captureMaxChars);
+
+    if (hasParts && textFull.trim() && cfg.enableFullContextMemory) {
+      fullRows.push({
+        roleLabel: roleRaw,
+        text: textFull,
+        category,
+        seqInBatch: seqFull++,
+      });
+    }
+
+    // 用户记忆 / 自进化：去掉注入块再抽取，避免把 recall XML、Sender 元数据写进逻辑记忆。
+    const bodyForExtraction =
+      roleRaw === "user" || roleRaw === "assistant" ? stripForLogicalMemoryExtraction(body).trim() : body;
+
+    if (roleRaw === "user" && hasParts && bodyForExtraction.length >= 2) {
+      userRawTexts.push(bodyForExtraction);
+    }
+
+    if ((roleRaw === "user" || roleRaw === "assistant") && hasParts && bodyForExtraction.length > 0) {
+      const uaLine = `[${roleRaw}] ${bodyForExtraction}`;
+      if (uaLine.length >= 5) {
+        uaLines.push(uaLine);
       }
-    }
-    if (linesByRole.assistant.length > 0) {
-      const assistantText = linesByRole.assistant
-        .map((line) => stripInjectedContextBlocks(line))
-        .filter((s) => s.length > 0)
-        .join("\n");
-      if (assistantText.length > 0) {
-        candidates.push({
-          category: FULL_CONTEXT_ASSISTANT,
-          text: truncateForCapture(assistantText, cfg.captureMaxChars),
-        });
-      }
-    }
-    if (linesByRole.system.length > 0) {
-      candidates.push({
-        category: FULL_CONTEXT_SYSTEM,
-        text: truncateForCapture(linesByRole.system.join("\n"), cfg.captureMaxChars),
-      });
-    }
-    if (linesByRole.tool.length > 0) {
-      candidates.push({
-        category: FULL_CONTEXT_TOOL,
-        text: truncateForCapture(linesByRole.tool.join("\n"), cfg.captureMaxChars),
-      });
-    }
-    if (linesByRole.tool_result.length > 0) {
-      candidates.push({
-        category: FULL_CONTEXT_TOOL_RESULT,
-        text: truncateForCapture(linesByRole.tool_result.join("\n"), cfg.captureMaxChars),
-      });
-    }
-    if (linesByRole.others.length > 0) {
-      candidates.push({
-        category: FULL_CONTEXT_OTHERS,
-        text: truncateForCapture(linesByRole.others.join("\n"), cfg.captureMaxChars),
-      });
     }
   }
 
-  const userTextsStripped = userMessageTexts
-    .map((t) => stripInjectedContextBlocks(t))
-    .filter((t) => t && t.length > 0);
+  const batchId = randomUUID();
+  const sid = sessionKey;
 
-  const llmTasks: Promise<void>[] = [];
-
-  if (cfg.memoryExtractionMethod === "llm" && cfg.llm) {
-    const filtered = userTextsStripped.filter(
-      (t) => t.length >= 10 && t.length <= cfg.captureMaxChars,
+  for (const row of fullRows) {
+    const fp = messageContentFingerprint(sessionKey, row.roleLabel, row.text);
+    if (await db.existsByContentHash(agentId, sid, fp)) {
+      continue;
+    }
+    const { vectors } = await backend.encodeForStorage(row.text);
+    if (vectors.length === 0) {
+      continue;
+    }
+    await db.storeMany(
+      agentId,
+      vectors.map((vector, idx) => ({
+        text: row.text,
+        vector,
+        importance: DEFAULT_IMPORTANCE,
+        category: row.category,
+        userId: null,
+        sessionId: sid,
+        batchId,
+        seqInBatch: row.seqInBatch,
+        contentHash: fp,
+        chunkIndex: idx,
+      })),
     );
-    if (filtered.length > 0) {
-      llmTasks.push(
-        extractUserMemoriesWithLLM(cfg.llm, filtered, MAX_AUTO_CAPTURE_LLM)
-          .then((extractions) => {
-            candidates.push(...extractions);
-          })
-          .catch(() => {}),
+  }
+
+  await Promise.all([
+    captureUserMemoryFromInboundTexts(cfg, db, backend, agentId, sid, userId, userRawTexts),
+    captureSelfImprovingFromLines(cfg, db, backend, agentId, sid, userId, uaLines),
+  ]);
+
+  map[key] = {
+    version: 2,
+    roleCounts: { ...running },
+    lastMessagesLength: messages.length,
+  };
+  saveAgentEndCursorMap(lancedbDir, map);
+}
+
+/** User memory from raw user message texts (agent_end user delta). */
+async function captureUserMemoryFromInboundTexts(
+  cfg: MemoryConfig,
+  db: MemoryDB,
+  backend: EmbeddingBackend,
+  agentId: string,
+  sessionKey: string,
+  userId: string | null,
+  inboundTexts: string[],
+): Promise<void> {
+  if (inboundTexts.length === 0) {
+    return;
+  }
+  const texts = inboundTexts
+    .map((t) => stripInjectedContextBlocks(t.trim()))
+    .filter((t) => t.length >= 2);
+  if (texts.length === 0) {
+    return;
+  }
+
+  const candidates: CaptureCandidate[] = [];
+  if (cfg.memoryExtractionMethod === "llm" && cfg.llm) {
+    const toSend = texts.filter((t) => t.length >= 10 && t.length <= cfg.captureMaxChars);
+    if (toSend.length > 0) {
+      const extractions = await extractUserMemoriesWithLLM(cfg.llm, toSend, MAX_AUTO_CAPTURE_LLM).catch(
+        () => [] as LLMExtractionItem[],
       );
+      for (const e of extractions) {
+        candidates.push({ category: e.category, text: e.text, importance: e.importance });
+      }
     }
   } else {
-    const toCapture = userTextsStripped.filter((t) =>
-      shouldCapture(t, { maxChars: cfg.captureMaxChars }),
-    );
-    for (const text of toCapture.slice(0, MAX_AUTO_CAPTURE_REGEX)) {
-      candidates.push({ category: detectCategory(text), text });
-    }
-  }
-
-  if (cfg.enableSelfImprovingMemory && userAndAssistantLines.length > 0) {
-    const raw = userAndAssistantLines.join("\n");
-    const fullText = stripInjectedContextBlocks(raw);
-    if (fullText.length > 0) {
-      if (cfg.memoryExtractionMethod === "llm" && cfg.llm) {
-        llmTasks.push(
-          extractSelfImprovingWithLLM(cfg.llm, fullText, MAX_AUTO_CAPTURE_SELF_IMPROVING)
-            .then((extractions) => {
-              for (const item of extractions) {
-                candidates.push({
-                  category: item.category,
-                  text: truncateForCapture(item.text, cfg.captureMaxChars),
-                  importance: item.importance,
-                });
-              }
-            })
-            .catch(() => {}),
-        );
-      } else {
-        const extractions = extractSelfImprovingWithRegex(fullText);
-        for (const item of extractions) {
-          candidates.push({
-            category: item.category,
-            text: truncateForCapture(item.text, cfg.captureMaxChars),
-          });
-        }
+    for (const stripped of texts) {
+      if (shouldCapture(stripped, { maxChars: cfg.captureMaxChars })) {
+        candidates.push({ category: detectCategory(stripped), text: stripped });
       }
     }
   }
 
-  if (llmTasks.length > 0) await Promise.all(llmTasks);
-  return candidates;
+  for (const item of candidates) {
+    const text = truncateForCapture(item.text, cfg.captureMaxChars);
+    const fp = memoryRowFingerprint(sessionKey, item.category, text);
+    if (await db.existsByContentHash(agentId, sessionKey, fp)) {
+      continue;
+    }
+    await storeOneCaptureItem(agentId, { ...item, text }, cfg, db, backend, {
+      userId,
+      sessionId: sessionKey,
+      contentHash: fp,
+    });
+  }
+}
+
+/** Self-improving from batched user+assistant lines (agent_end delta). */
+async function captureSelfImprovingFromLines(
+  cfg: MemoryConfig,
+  db: MemoryDB,
+  backend: EmbeddingBackend,
+  agentId: string,
+  sessionKey: string,
+  userId: string | null,
+  lines: string[],
+): Promise<void> {
+  if (!cfg.enableSelfImprovingMemory || lines.length === 0) {
+    return;
+  }
+  const strippedLines = lines
+    .map((l) => stripInjectedContextBlocks(l.trim()))
+    .filter((l) => l.length >= 5);
+  if (strippedLines.length === 0) {
+    return;
+  }
+
+  const candidates: CaptureCandidate[] = [];
+  if (cfg.memoryExtractionMethod === "llm" && cfg.llm) {
+    const combined = strippedLines.join("\n\n");
+    const extractions = await extractSelfImprovingWithLLM(
+      cfg.llm,
+      combined,
+      MAX_AUTO_CAPTURE_SELF_IMPROVING,
+    ).catch(() => [] as SelfImprovingExtractionItem[]);
+    for (const e of extractions) {
+      candidates.push({
+        category: e.category,
+        text: truncateForCapture(e.text, cfg.captureMaxChars),
+        importance: e.importance,
+      });
+    }
+  } else {
+    for (const line of strippedLines) {
+      for (const e of extractSelfImprovingWithRegex(line)) {
+        candidates.push({
+          category: e.category,
+          text: truncateForCapture(e.text, cfg.captureMaxChars),
+        });
+      }
+    }
+  }
+
+  for (const item of candidates) {
+    const fp = memoryRowFingerprint(sessionKey, item.category, item.text);
+    if (await db.existsByContentHash(agentId, sessionKey, fp)) {
+      continue;
+    }
+    await storeOneCaptureItem(agentId, item, cfg, db, backend, {
+      userId,
+      sessionId: sessionKey,
+      contentHash: fp,
+    });
+  }
 }
 
 /** Result of storing one memory: whether it was an update or insert, and the stored entry. */
@@ -764,44 +950,95 @@ function getDedupCategories(category: MemoryCategory): readonly MemoryCategory[]
 }
 
 /** Store a single capture candidate: embed, dedup (simple or LLM), then insert. Returns action and stored entry. */
-async function storeOneCaptureItem(
-  agentId: string,
+function buildChunkRows(
   item: CaptureCandidate,
-  cfg: MemoryConfig,
-  db: MemoryDB,
-  embeddings: Embeddings,
-  options?: { userId?: string | null; sessionId?: string | null },
-): Promise<StoreOneResult> {
+  vectors: number[][],
+  options?: {
+    userId?: string | null;
+    sessionId?: string | null;
+    contentHash?: string | null;
+    batchId?: string | null;
+    seqInBatch?: number | null;
+  },
+): Array<{
+  text: string;
+  vector: number[];
+  importance: number;
+  category: MemoryCategory;
+  userId?: string | null;
+  sessionId?: string | null;
+  contentHash?: string | null;
+  batchId?: string | null;
+  seqInBatch?: number | null;
+  chunkIndex?: number | null;
+}> {
   const importance = item.importance ?? DEFAULT_IMPORTANCE;
-  const vector = await embeddings.embed(item.text);
-  const threshold = getThresholdForCategory(cfg, item.category);
-  const dedupCategories = getDedupCategories(item.category);
-  const storePayload = {
+  const seqInBatch =
+    typeof options?.seqInBatch === "number" && Number.isFinite(options.seqInBatch)
+      ? Math.floor(options.seqInBatch)
+      : 0;
+  return vectors.map((vector, idx) => ({
     text: item.text,
     vector,
     importance,
     category: item.category,
     userId: options?.userId ?? null,
     sessionId: options?.sessionId ?? null,
-  };
+    contentHash: options?.contentHash ?? null,
+    batchId: options?.batchId ?? null,
+    seqInBatch,
+    chunkIndex: idx,
+  }));
+}
 
-  // Full-context by source: upsert by (agent_id, session_id, category) so one row per session per category.
+async function deleteSimilarLogicalMemory(
+  db: MemoryDB,
+  agentId: string,
+  sessionId: string | null | undefined,
+  hit: MemorySearchResult,
+): Promise<void> {
+  const hash = hit.entry.contentHash;
+  if (hash && hash.length > 0) {
+    await db.deleteByContentHash(agentId, sessionId, hash);
+  } else {
+    await db.delete(agentId, hit.entry.id);
+  }
+}
+
+async function storeOneCaptureItem(
+  agentId: string,
+  item: CaptureCandidate,
+  cfg: MemoryConfig,
+  db: MemoryDB,
+  backend: EmbeddingBackend,
+  options?: {
+    userId?: string | null;
+    sessionId?: string | null;
+    contentHash?: string | null;
+    batchId?: string | null;
+    seqInBatch?: number | null;
+  },
+): Promise<StoreOneResult> {
+  const { vectors } = await backend.encodeForStorage(item.text);
+  if (vectors.length === 0) {
+    throw new Error("openclaw-memory-alibaba-local: encodeForStorage returned no vectors");
+  }
+  const threshold = getThresholdForCategory(cfg, item.category);
+  const dedupCategories = getDedupCategories(item.category);
+  const rows = buildChunkRows(item, vectors, options);
+
   if (isFullContextSourceCategory(item.category)) {
-    const { action, entry } = await db.storeOrUpdateFullContext(agentId, options?.sessionId ?? null, {
-      text: storePayload.text,
-      vector: storePayload.vector,
-      importance: storePayload.importance,
-      category: storePayload.category,
-      userId: options?.userId ?? null,
-    });
-    return { action, entry };
+    const stored = await db.storeMany(agentId, rows);
+    return { action: "created", entry: stored[0]! };
   }
 
   if (!cfg.memory_duplication_conflict_process) {
-    const existing = await db.search(agentId, vector, 1, threshold, [...dedupCategories]);
-    if (existing.length > 0) await db.softDelete(agentId, existing[0].entry.id);
-    const entry = await db.store(agentId, storePayload);
-    return { action: existing.length > 0 ? "updated" : "created", entry };
+    const similar = await db.searchMerged(agentId, vectors, 1, threshold, [...dedupCategories]);
+    if (similar.length > 0) {
+      await deleteSimilarLogicalMemory(db, agentId, options?.sessionId, similar[0]!);
+    }
+    const stored = await db.storeMany(agentId, rows);
+    return { action: similar.length > 0 ? "updated" : "created", entry: stored[0]! };
   }
 
   // Lower recall bar for conflict/dedup for both user_memory_* and self_improving_*:
@@ -809,21 +1046,31 @@ async function storeOneCaptureItem(
   // only moderate embedding similarity (~0.65–0.8); without this they may not enter the candidate list.
   const recallMinScore = Math.max(0.5, threshold - 0.35);
   const conflictCandidateLimit = 20;
-  const candidates = await db.search(agentId, vector, conflictCandidateLimit, recallMinScore, [...dedupCategories]);
+  const candidates = await db.searchMerged(
+    agentId,
+    vectors,
+    conflictCandidateLimit,
+    recallMinScore,
+    [...dedupCategories],
+  );
   if (candidates.length === 0) {
-    const entry = await db.store(agentId, storePayload);
-    return { action: "created", entry };
+    const stored = await db.storeMany(agentId, rows);
+    return { action: "created", entry: stored[0]! };
   }
 
   const decision = await decideInsertOrUpdate(cfg.llm!, item.text, candidates);
-  if (decision.action === "update") await db.softDelete(agentId, decision.memoryId);
-  const entry = await db.store(agentId, storePayload);
-  return { action: decision.action === "update" ? "updated" : "created", entry };
+  if (decision.action === "update") {
+    const hit =
+      candidates.find((c) => c.entry.id === decision.memoryId) ?? candidates[0]!;
+    await deleteSimilarLogicalMemory(db, agentId, options?.sessionId, hit);
+  }
+  const stored = await db.storeMany(agentId, rows);
+  return { action: decision.action === "update" ? "updated" : "created", entry: stored[0]! };
 }
 
 type PreparedNonFullStore = {
   item: CaptureCandidate;
-  vector: number[];
+  vectors: number[][];
   similar: MemorySearchResult[];
 };
 
@@ -836,26 +1083,29 @@ async function storeNonFullContextItemsBatch(
   items: CaptureCandidate[],
   cfg: MemoryConfig,
   db: MemoryDB,
-  embeddings: Embeddings,
+  backend: EmbeddingBackend,
   options?: { userId?: string | null; sessionId?: string | null },
 ): Promise<void> {
   if (items.length === 0) return;
 
   if (!cfg.memory_duplication_conflict_process) {
     for (const item of items) {
-      await storeOneCaptureItem(agentId, item, cfg, db, embeddings, options);
+      await storeOneCaptureItem(agentId, item, cfg, db, backend, options);
     }
     return;
   }
 
   const prepared: PreparedNonFullStore[] = await Promise.all(
     items.map(async (item) => {
-      const vector = await embeddings.embed(item.text);
+      const { vectors } = await backend.encodeForStorage(item.text);
       const threshold = getThresholdForCategory(cfg, item.category);
       const dedupCategories = getDedupCategories(item.category);
       const recallMinScore = Math.max(0.5, threshold - 0.35);
-      const similar = await db.search(agentId, vector, 20, recallMinScore, [...dedupCategories]);
-      return { item, vector, similar };
+      const similar =
+        vectors.length === 0
+          ? []
+          : await db.searchMerged(agentId, vectors, 20, recallMinScore, [...dedupCategories]);
+      return { item, vectors, similar };
     }),
   );
 
@@ -870,14 +1120,10 @@ async function storeNonFullContextItemsBatch(
   const sid = options?.sessionId ?? null;
 
   for (const p of noConflict) {
-    await db.store(agentId, {
-      text: p.item.text,
-      vector: p.vector,
-      importance: p.item.importance ?? DEFAULT_IMPORTANCE,
-      category: p.item.category,
-      userId: uid,
-      sessionId: sid,
-    });
+    if (p.vectors.length === 0) {
+      continue;
+    }
+    await db.storeMany(agentId, buildChunkRows(p.item, p.vectors, { userId: uid, sessionId: sid }));
   }
 
   if (needJudge.length === 0) return;
@@ -888,17 +1134,17 @@ async function storeNonFullContextItemsBatch(
   );
 
   for (let i = 0; i < needJudge.length; i++) {
-    const p = needJudge[i];
+    const p = needJudge[i]!;
     const d = decisions[i] ?? { action: "insert" as const };
-    if (d.action === "update") await db.softDelete(agentId, d.memoryId);
-    await db.store(agentId, {
-      text: p.item.text,
-      vector: p.vector,
-      importance: p.item.importance ?? DEFAULT_IMPORTANCE,
-      category: p.item.category,
-      userId: uid,
-      sessionId: sid,
-    });
+    if (p.vectors.length === 0) {
+      continue;
+    }
+    if (d.action === "update") {
+      const hit =
+        p.similar.find((c) => c.entry.id === d.memoryId) ?? p.similar[0]!;
+      await deleteSimilarLogicalMemory(db, agentId, sid, hit);
+    }
+    await db.storeMany(agentId, buildChunkRows(p.item, p.vectors, { userId: uid, sessionId: sid }));
   }
 }
 
@@ -916,17 +1162,16 @@ const memoryPlugin = {
 
   register(api: OpenClawPluginApi) {
     const cfg = memoryConfigSchema.parse(api.pluginConfig);
-    let embeddings: Embeddings | null = null;
+    let backend: EmbeddingBackend | null = null;
     const resolvedDbPath = api.resolvePath(cfg.dbPath!);
-    const vectorDim = cfg.embedding
-      ? vectorDimsForModel(cfg.embedding.model, cfg.embedding.dimensions)
-      : vectorDimsForModel("text-embedding-v3", undefined);
+    const vectorDim = cfg.embedding ? embeddingVectorDim(cfg.embedding) : 768;
     const db = new MemoryDB(resolvedDbPath, vectorDim);
     if (cfg.embedding) {
-      const { model, dimensions, apiKey, baseUrl } = cfg.embedding;
-      embeddings = new Embeddings(apiKey, model, baseUrl, vectorDim);
+      backend = createEmbeddingBackend(cfg.embedding);
+      const mode = cfg.embedding.mode;
+      const modelHint = mode === "remote" ? cfg.embedding.model : "local-cli";
       api.logger.info(
-        `openclaw-memory-alibaba-local: registered (db: ${resolvedDbPath}, table: ${LANCEDB_TABLE_NAME})`,
+        `openclaw-memory-alibaba-local: registered (db: ${resolvedDbPath}, table: ${LANCEDB_TABLE_NAME}, embedMode: ${mode}, model: ${modelHint})`,
       );
     } else {
       api.logger.info(
@@ -934,11 +1179,21 @@ const memoryPlugin = {
       );
     }
 
-    const getDbAndEmbeddings = (): { db: MemoryDB; embeddings: Embeddings } | null =>
-      embeddings ? { db, embeddings } : null;
+    const getDbAndBackend = (): { db: MemoryDB; backend: EmbeddingBackend } | null =>
+      backend ? { db, backend } : null;
 
     if (typeof api.registerHttpRoute === "function") {
-      registerMemoryPanelRoutes(api.registerHttpRoute.bind(api), db, cfg, api.logger);
+      registerMemoryPanelRoutes(
+        api.registerHttpRoute.bind(api),
+        db,
+        cfg,
+        api.logger,
+        backend
+          ? {
+              encodeForStorage: (text) => backend!.encodeForStorage(text),
+            }
+          : undefined,
+      );
     } else {
       api.logger.warn("openclaw-memory-alibaba-local: registerHttpRoute missing — /plugins/memory UI disabled");
     }
@@ -956,7 +1211,7 @@ const memoryPlugin = {
           limit: Type.Optional(Type.Number({ description: "Max results (default: 5)" })),
         }),
         async execute(_toolCallId, params) {
-          const out = getDbAndEmbeddings();
+          const out = getDbAndBackend();
           if (!out) {
             return {
               content: [
@@ -968,15 +1223,15 @@ const memoryPlugin = {
               details: { error: "not_configured" },
             };
           }
-          const { db, embeddings } = out;
+          const { db, backend } = out;
           const { query, limit = RECALL_LIMIT_USER_DEFAULT } = params as { query: string; limit?: number };
-          const agentId = ctx.agentId ?? "default";
-          const vector = await embeddings.embed(query);
+          const agentId = resolveAgentIdForMemory(ctx);
+          const queryVectors = await embedQueryVectors(backend, query);
           const limitUser = Math.max(1, limit);
           const limitSelf = cfg.enableSelfImprovingMemory
             ? Math.max(1, Math.min(RECALL_LIMIT_SELF, limit))
             : 0;
-          const results = await runRecall(db, cfg, agentId, vector, {
+          const results = await runRecall(db, cfg, agentId, queryVectors, {
             limitUser,
             limitSelf,
             minScore: RECALL_MIN_SCORE_RELAXED,
@@ -1045,7 +1300,7 @@ const memoryPlugin = {
           ),
         }),
         async execute(_toolCallId, params) {
-          const out = getDbAndEmbeddings();
+          const out = getDbAndBackend();
           if (!out) {
             return {
               content: [
@@ -1057,7 +1312,7 @@ const memoryPlugin = {
               details: { error: "not_configured" },
             };
           }
-          const { db, embeddings } = out;
+          const { db, backend } = out;
           const {
             text,
             importance = DEFAULT_IMPORTANCE,
@@ -1082,11 +1337,12 @@ const memoryPlugin = {
             };
           }
 
-          const agentId = ctx.agentId ?? "default";
+          const agentId = resolveAgentIdForMemory(ctx);
           const userId = (ctx as { requesterSenderId?: string }).requesterSenderId ?? null;
-          const sessionId = (ctx as { sessionId?: string }).sessionId ?? null;
+          const storageKey = resolveStorageSessionKey(ctx);
+          const sessionId = storageKey || null;
           const item: CaptureCandidate = { category, text, importance };
-          const { action, entry } = await storeOneCaptureItem(agentId, item, cfg, db, embeddings, { userId, sessionId });
+          const { action, entry } = await storeOneCaptureItem(agentId, item, cfg, db, backend, { userId, sessionId });
           const preview = text.length > 100 ? text.slice(0, 100) + "..." : text;
           return {
             content: [{ type: "text", text: `${action === "updated" ? "Updated" : "Stored"}: "${preview}"` }],
@@ -1107,7 +1363,7 @@ const memoryPlugin = {
           memoryId: Type.Optional(Type.String({ description: "Specific memory ID" })),
         }),
         async execute(_toolCallId, params) {
-          const out = getDbAndEmbeddings();
+          const out = getDbAndBackend();
           if (!out) {
             return {
               content: [
@@ -1119,9 +1375,9 @@ const memoryPlugin = {
               details: { error: "not_configured" },
             };
           }
-          const { db, embeddings } = out;
+          const { db, backend } = out;
           const { query, memoryId } = params as { query?: string; memoryId?: string };
-          const agentId = ctx.agentId ?? "default";
+          const agentId = resolveAgentIdForMemory(ctx);
 
           if (memoryId) {
             const deleted = await db.delete(agentId, memoryId);
@@ -1138,19 +1394,32 @@ const memoryPlugin = {
           }
 
           if (query) {
-            const vector = await embeddings.embed(query);
-            const results = await db.search(agentId, vector, RECALL_LIMIT_USER_DEFAULT, RECALL_MIN_SCORE_STRICT);
+            const queryVectors = await embedQueryVectors(backend, query);
+            const results = await db.searchMerged(
+              agentId,
+              queryVectors,
+              RECALL_LIMIT_USER_DEFAULT,
+              RECALL_MIN_SCORE_STRICT,
+            );
             if (results.length === 0) {
               return {
                 content: [{ type: "text", text: "No matching memories found." }],
                 details: { found: 0 },
               };
             }
-            if (results.length === 1 && results[0].score > 0.9) {
-              await db.delete(agentId, results[0].entry.id);
+            if (results.length === 1 && results[0]!.score > 0.9) {
+              const r = results[0]!.entry;
+              if (r.contentHash && r.contentHash.length > 0) {
+                const n = await db.deleteByContentHash(agentId, r.sessionId, r.contentHash);
+                return {
+                  content: [{ type: "text", text: `Forgotten: "${r.text}"` }],
+                  details: { action: "deleted", rows: n, id: r.id },
+                };
+              }
+              await db.delete(agentId, r.id);
               return {
-                content: [{ type: "text", text: `Forgotten: "${results[0].entry.text}"` }],
-                details: { action: "deleted", id: results[0].entry.id },
+                content: [{ type: "text", text: `Forgotten: "${r.text}"` }],
+                details: { action: "deleted", id: r.id },
               };
             }
             const list = results
@@ -1184,21 +1453,21 @@ const memoryPlugin = {
       { name: "memory_forget" },
     );
 
-    // --- Hooks: before_agent_start (recall), agent_end (auto-capture) ---
+    // --- Hooks: before_prompt_build (recall), agent_end (auto-capture) ---
 
     if (cfg.autoRecall) {
-      api.on("before_agent_start", async (event, ctx) => {
-        if (!db || !embeddings) return;
+      api.on("before_prompt_build", async (event, ctx) => {
+        if (!db || !backend) return;
         if (!event.prompt || event.prompt.length < 5) return;
 
         try {
           const tRecall0 = Date.now();
-          const agentId = ctx.agentId ?? "default";
+          const agentId = resolveAgentIdForMemory(ctx);
           const tEmb0 = Date.now();
-          const vector = await embeddings.embed(event.prompt);
+          const queryVectors = await embedQueryVectors(backend, event.prompt);
           const embedMs = Date.now() - tEmb0;
           const tSearch0 = Date.now();
-          const results = await runRecall(db, cfg, agentId, vector, {
+          const results = await runRecall(db, cfg, agentId, queryVectors, {
             limitUser: RECALL_LIMIT_USER_BEFORE_START,
             limitSelf: cfg.enableSelfImprovingMemory ? RECALL_LIMIT_SELF : 0,
             minScore: RECALL_MIN_SCORE_HOOK,
@@ -1219,6 +1488,7 @@ const memoryPlugin = {
                 category: r.entry.category,
                 text: r.entry.text,
                 createdAt: r.entry.createdAt,
+                importance: r.entry.importance ?? 0,
               })),
             ),
           };
@@ -1230,106 +1500,41 @@ const memoryPlugin = {
 
     if (cfg.autoCapture) {
       api.on("agent_end", async (event, ctx) => {
-        if (!db || !embeddings) return;
-        if (!event.success || !event.messages || event.messages.length === 0) return;
+        if (!db || !backend) {
+          return;
+        }
+        if (!event.success || !event.messages || event.messages.length === 0) {
+          return;
+        }
 
         try {
           const tCap0 = Date.now();
-          const agentId = ctx.agentId ?? "default";
-          const userId = (ctx as { requesterSenderId?: string }).requesterSenderId ?? null;
-          const sessionId = (ctx as { sessionId?: string }).sessionId ?? (event as { sessionId?: string }).sessionId ?? null;
-          const { userMessageTexts, allMessageLines, userAndAssistantLines, linesByRole } = parseMessagesForCapture(
-            event.messages,
-          );
-          api.logger.info(
-            `openclaw-memory-alibaba-local: agent_end messages=${event.messages.length} user=${linesByRole.user.length} assistant=${linesByRole.assistant.length} system=${linesByRole.system.length} tool=${linesByRole.tool.length} tool_result=${linesByRole.tool_result.length} others=${linesByRole.others.length}`,
-          );
-          if (linesByRole.user.length === 0 && event.messages.length > 0) {
-            const roles = (event.messages as Array<Record<string, unknown>>).map((m) => m.role ?? "?");
+          const storageSessionKey = resolveStorageSessionKey(ctx);
+          if (!storageSessionKey) {
             api.logger.warn(
-              `openclaw-memory-alibaba-local: no user lines parsed; message roles: ${roles.join(", ")}`,
-            );
-          }
-          const tBuild0 = Date.now();
-          api.logger.info("openclaw-memory-alibaba-local: agent_end buildCaptureCandidates start");
-          const toProcess = await buildCaptureCandidates(
-            cfg,
-            userMessageTexts,
-            allMessageLines,
-            userAndAssistantLines,
-            linesByRole,
-          );
-          const buildMs = Date.now() - tBuild0;
-          api.logger.info(
-            `openclaw-memory-alibaba-local: agent_end capture candidates=${toProcess.length}`,
-          );
-          if (toProcess.length === 0) {
-            api.logger.info(
-              `openclaw-memory-alibaba-local: agent_end skip capture (0 candidates); fullContext=${cfg.enableFullContextMemory} selfImproving=${cfg.enableSelfImprovingMemory} conflictLlm=${cfg.memory_duplication_conflict_process} userLines=${linesByRole.user.length} asstLines=${linesByRole.assistant.length} strippedUserChars=${userMessageTexts.map((t) => stripInjectedContextBlocks(t)).join("").length}`,
-            );
-            api.logger.info(
-              `openclaw-memory-alibaba-local: capture timing buildCandidatesMs=${buildMs} storeWallMs=0 totalHookMs=${Date.now() - tCap0} items=0`,
+              "openclaw-memory-alibaba-local: agent_end skip capture (no sessionKey/sessionId)",
             );
             return;
           }
-
-          const tStore0 = Date.now();
-          let storeMaxSingleMs = 0;
-
-          const fullItems = toProcess.filter((i) => isFullContextSourceCategory(i.category));
-          const otherItems = toProcess.filter((i) => !isFullContextSourceCategory(i.category));
-          const userCapItems = otherItems.filter((i) => isUserMemoryCategory(i.category));
-          const selfCapItems = otherItems.filter((i) => isSelfImprovingCategory(i.category));
-          const miscCapItems = otherItems.filter(
-            (i) => !isUserMemoryCategory(i.category) && !isSelfImprovingCategory(i.category),
+          const agentId = resolveAgentIdForMemory(ctx);
+          const userIdRaw = (ctx as { requesterSenderId?: string }).requesterSenderId;
+          const userId = typeof userIdRaw === "string" && userIdRaw.trim() ? userIdRaw.trim() : null;
+          await runAgentEndCapture(
+            cfg,
+            db,
+            backend,
+            agentId,
+            storageSessionKey,
+            userId,
+            event.messages,
+            resolvedDbPath,
+            api.logger,
           );
-
-          async function storeOneTimed(item: CaptureCandidate): Promise<number> {
-            const tOne = Date.now();
-            await storeOneCaptureItem(agentId, item, cfg, db, embeddings, { userId, sessionId });
-            return Date.now() - tOne;
-          }
-
-          if (fullItems.length > 0) {
-            const tPar = Date.now();
-            const fullMsList = await Promise.all(fullItems.map((item) => storeOneTimed(item)));
-            const parallelWallMs = Date.now() - tPar;
-            for (const ms of fullMsList) {
-              if (ms > storeMaxSingleMs) storeMaxSingleMs = ms;
-            }
-            api.logger.info(
-              `openclaw-memory-alibaba-local: capture fullContext parallel store wallMs=${parallelWallMs} count=${fullItems.length} (embed+db overlap vs sequential sum)`,
-            );
-          }
-
-          const opt = { userId, sessionId };
-          const tUserSelf = Date.now();
-          await Promise.all([
-            storeNonFullContextItemsBatch(agentId, userCapItems, cfg, db, embeddings, opt),
-            storeNonFullContextItemsBatch(agentId, selfCapItems, cfg, db, embeddings, opt),
-          ]);
-          const userSelfWallMs = Date.now() - tUserSelf;
-          if (userCapItems.length > 0 || selfCapItems.length > 0) {
-            api.logger.info(
-              `openclaw-memory-alibaba-local: capture user/self batch parallel wallMs=${userSelfWallMs} user=${userCapItems.length} self=${selfCapItems.length} (conflict LLM batched per class when enabled)`,
-            );
-          }
-
-          for (const item of miscCapItems) {
-            const ms = await storeOneTimed(item);
-            if (ms > storeMaxSingleMs) storeMaxSingleMs = ms;
-          }
-
-          const stored = toProcess.length;
-          const storeWallMs = Date.now() - tStore0;
-          if (stored > 0) {
-            api.logger.info(`openclaw-memory-alibaba-local: auto-captured ${stored} memories`);
-          }
           api.logger.info(
-            `openclaw-memory-alibaba-local: capture timing buildCandidatesMs=${buildMs} storeWallMs=${storeWallMs} storeMaxSingleItemMs=${storeMaxSingleMs} totalHookMs=${Date.now() - tCap0} items=${stored} fullContext=${fullItems.length} userMem=${userCapItems.length} selfImp=${selfCapItems.length} misc=${miscCapItems.length}`,
+            `openclaw-memory-alibaba-local: agent_end capture done totalHookMs=${Date.now() - tCap0} messages=${event.messages.length}`,
           );
         } catch (err) {
-          api.logger.warn(`openclaw-memory-alibaba-local: capture failed: ${String(err)}`);
+          api.logger.warn(`openclaw-memory-alibaba-local: agent_end capture failed: ${String(err)}`);
         }
       });
     }
@@ -1338,8 +1543,9 @@ const memoryPlugin = {
       id: "openclaw-memory-alibaba-local",
       start: () => {
         if (cfg.embedding) {
+          const em = cfg.embedding;
           api.logger.info(
-            `openclaw-memory-alibaba-local: started (db: ${resolvedDbPath}, model: ${cfg.embedding.model})`,
+            `openclaw-memory-alibaba-local: started (db: ${resolvedDbPath}, embedMode: ${em.mode}${em.mode === "remote" ? `, model: ${em.model}` : ""})`,
           );
         } else {
           api.logger.info("openclaw-memory-alibaba-local: started (memory not configured)");

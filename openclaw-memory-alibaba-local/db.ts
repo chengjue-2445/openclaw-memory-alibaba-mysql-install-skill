@@ -1,7 +1,13 @@
 import { randomUUID } from "node:crypto";
 import type * as LanceDB from "@lancedb/lancedb";
 import type { MemoryCategory } from "./config.js";
-import { USER_MEMORY_FACT } from "./categories.js";
+import {
+  FULL_CONTEXT_MEMORY,
+  FULL_CONTEXT_SOURCE_CATEGORIES,
+  SELF_IMPROVING_CATEGORIES,
+  USER_MEMORY_FACT,
+  USER_MEMORY_CATEGORIES,
+} from "./categories.js";
 
 export type MemoryEntry = {
   id: string;
@@ -12,6 +18,13 @@ export type MemoryEntry = {
   category: MemoryCategory;
   createdAt: number;
   isDeleted?: number;
+  /** agent_end batch grouping for full-context rows */
+  batchId?: string;
+  seqInBatch?: number;
+  /** Dedup / idempotency (sha256 hex) */
+  contentHash?: string;
+  /** 同一逻辑记忆多向量行时的段序号（0..n-1）；与 seqInBatch 配合排序 */
+  chunkIndex?: number;
 };
 
 export type MemorySearchResult = {
@@ -63,6 +76,14 @@ function normSessionId(v: string | null | undefined): string {
 function rowToEntry(row: Record<string, unknown>, fallbackAgentId?: string): MemoryEntry {
   const isDel = row.isDeleted;
   const aid = String(row.agentId ?? fallbackAgentId ?? "");
+  const batchId = row.batchId != null && String(row.batchId).length > 0 ? String(row.batchId) : undefined;
+  const seqRaw = row.seqInBatch;
+  const seqInBatch =
+    typeof seqRaw === "number" && Number.isFinite(seqRaw) ? Math.floor(seqRaw) : undefined;
+  const ch = row.contentHash != null && String(row.contentHash).length > 0 ? String(row.contentHash) : undefined;
+  const ciRaw = row.chunkIndex;
+  const chunkIndex =
+    typeof ciRaw === "number" && Number.isFinite(ciRaw) ? Math.floor(ciRaw) : undefined;
   return {
     id: String(row.id ?? ""),
     agentId: aid,
@@ -72,6 +93,10 @@ function rowToEntry(row: Record<string, unknown>, fallbackAgentId?: string): Mem
     category: ((row.category as MemoryCategory) || USER_MEMORY_FACT) as MemoryCategory,
     createdAt: Number(row.createdAt ?? 0),
     isDeleted: isDel !== undefined && isDel !== null ? Number(isDel) : undefined,
+    batchId,
+    seqInBatch,
+    contentHash: ch,
+    chunkIndex,
   };
 }
 
@@ -81,8 +106,73 @@ export type AdminListFilters = {
   sessionId?: string;
   timeFromMs?: number;
   timeToMs?: number;
-  includeDeleted: boolean;
 };
+
+/** 管理端「记忆大盘」聚合（与列表共用时间 / Agent / 会话条件；不按 Tab 类别过滤）。 */
+export type MemoryDashboardAggregate = {
+  total: number;
+  timeFromMs: number;
+  timeToMs: number;
+  byKind: { user: number; self: number; full: number; other: number };
+  byCategory: Record<string, number>;
+  byBucket: Array<{ key: string; label: string; count: number }>;
+  topAgents: Array<{ agentId: string; count: number }>;
+  topSessions: Array<{ sessionId: string; count: number }>;
+  importance: { low: number; mid: number; high: number; avg: number };
+  uniqueAgents: number;
+  uniqueSessions: number;
+};
+
+const USER_CAT_SET = new Set<string>(USER_MEMORY_CATEGORIES);
+const SELF_CAT_SET = new Set<string>(SELF_IMPROVING_CATEGORIES);
+const FULL_CAT_SET = new Set<string>([FULL_CONTEXT_MEMORY, ...FULL_CONTEXT_SOURCE_CATEGORIES]);
+
+function memoryCategoryKind(category: string): "user" | "self" | "full" | "other" {
+  if (USER_CAT_SET.has(category)) {
+    return "user";
+  }
+  if (SELF_CAT_SET.has(category)) {
+    return "self";
+  }
+  if (FULL_CAT_SET.has(category)) {
+    return "full";
+  }
+  return "other";
+}
+
+function pad2(n: number): string {
+  return n < 10 ? `0${n}` : String(n);
+}
+
+/** 与写入趋势按日桶一致，使用本地时间的年月键。 */
+function localYearMonthKeyFromMs(ms: number): string {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`;
+}
+
+/** 覆盖 [fromMs, toMs] 内涉及的每个自然月（本地），顺序从早到晚。 */
+function localMonthsOverlappingRange(fromMs: number, toMs: number): Array<{ key: string; label: string }> {
+  const start = new Date(fromMs);
+  const end = new Date(toMs);
+  let y = start.getFullYear();
+  let m = start.getMonth();
+  const endY = end.getFullYear();
+  const endM = end.getMonth();
+  const out: Array<{ key: string; label: string }> = [];
+  while (y < endY || (y === endY && m <= endM)) {
+    const key = `${y}-${pad2(m + 1)}`;
+    out.push({ key, label: key });
+    m += 1;
+    if (m > 11) {
+      m = 0;
+      y += 1;
+    }
+  }
+  return out;
+}
+
+/** 写入趋势：按日桶时跨度上限（天）；超过则改为按月桶，避免一年只有 60 天有数据。 */
+const DASHBOARD_MAX_DAILY_SPAN_MS = 60 * 86400000;
 
 function buildAdminWhereClause(f: AdminListFilters): string {
   const parts: string[] = [];
@@ -91,9 +181,7 @@ function buildAdminWhereClause(f: AdminListFilters): string {
     const list = f.categories.map((c) => `'${sqlEscapeLiteral(String(c))}'`).join(", ");
     parts.push(`category IN (${list})`);
   }
-  if (!f.includeDeleted) {
-    parts.push(`isDeleted = 0`);
-  }
+  parts.push(`isDeleted = 0`);
   if (typeof f.timeFromMs === "number" && Number.isFinite(f.timeFromMs)) {
     parts.push(`createdAt >= ${Math.floor(f.timeFromMs)}`);
   }
@@ -109,6 +197,57 @@ function buildAdminWhereClause(f: AdminListFilters): string {
     parts.push(`sessionId = '${sqlEscapeLiteral(sid)}'`);
   }
   return parts.join(" AND ");
+}
+
+function compareSeqInBatchThenChunk(a: MemoryEntry, b: MemoryEntry): number {
+  const sb = (a.seqInBatch ?? 0) - (b.seqInBatch ?? 0);
+  if (sb !== 0) {
+    return sb;
+  }
+  return (a.chunkIndex ?? 0) - (b.chunkIndex ?? 0);
+}
+
+/**
+ * 全文记忆管理端：按 batchId 分组；轮次之间按 batch 时间 sortDesc，组内始终时间/seq/chunk 正序。
+ */
+function sortFullContextAdminGrouped(entries: MemoryEntry[], batchOrderNewestFirst: boolean): void {
+  const withBatch = new Map<string, MemoryEntry[]>();
+  const noBatch: MemoryEntry[] = [];
+  for (const e of entries) {
+    const bid = e.batchId != null && String(e.batchId).trim() ? String(e.batchId).trim() : "";
+    if (!bid) {
+      noBatch.push(e);
+      continue;
+    }
+    let arr = withBatch.get(bid);
+    if (!arr) {
+      arr = [];
+      withBatch.set(bid, arr);
+    }
+    arr.push(e);
+  }
+  for (const arr of withBatch.values()) {
+    arr.sort((a, b) => {
+      if (a.createdAt !== b.createdAt) {
+        return a.createdAt - b.createdAt;
+      }
+      return compareSeqInBatchThenChunk(a, b);
+    });
+  }
+  const batchKeys = [...withBatch.keys()];
+  batchKeys.sort((ka, kb) => {
+    const ta = withBatch.get(ka)![0]!.createdAt;
+    const tb = withBatch.get(kb)![0]!.createdAt;
+    return batchOrderNewestFirst ? tb - ta : ta - tb;
+  });
+  entries.length = 0;
+  for (const k of batchKeys) {
+    entries.push(...withBatch.get(k)!);
+  }
+  noBatch.sort((a, b) => {
+    return batchOrderNewestFirst ? b.createdAt - a.createdAt : a.createdAt - b.createdAt;
+  });
+  entries.push(...noBatch);
 }
 
 async function createScalarIndexesWithBootstrap(
@@ -128,6 +267,10 @@ async function createScalarIndexesWithBootstrap(
       category: USER_MEMORY_FACT,
       createdAt: 0,
       isDeleted: 1,
+      batchId: "",
+      seqInBatch: 0,
+      contentHash: "",
+      chunkIndex: 0,
     },
   ]);
   try {
@@ -193,6 +336,10 @@ export class MemoryDB {
         category: USER_MEMORY_FACT,
         createdAt: 0,
         isDeleted: 1,
+        batchId: "",
+        seqInBatch: 0,
+        contentHash: "",
+        chunkIndex: 0,
       };
       this.table = await this.db.createTable(LANCEDB_TABLE_NAME, [seed]);
       await this.table.delete('id = "__schema__"');
@@ -208,12 +355,188 @@ export class MemoryDB {
   }
 
   /**
-   * List rows for admin UI: createdAt desc, paginated. Throws if match count > ADMIN_LIST_MAX_MATCHING.
+   * 记忆大盘：在时间与可选 Agent/会话下扫描全部类别，内存聚合。
+   * 与列表相同行数上限，避免一次加载过多。
+   */
+  async getAdminDashboardAggregates(
+    timeFromMs: number,
+    timeToMs: number,
+    agentId?: string,
+    sessionId?: string,
+  ): Promise<MemoryDashboardAggregate> {
+    const filters: AdminListFilters = {
+      categories: [],
+      timeFromMs,
+      timeToMs,
+    };
+    const aid = (agentId ?? "").trim();
+    const sid = (sessionId ?? "").trim();
+    if (aid) {
+      filters.agentId = aid;
+    }
+    if (sid) {
+      filters.sessionId = sid;
+    }
+    await this.ensureInitialized();
+    const where = buildAdminWhereClause(filters);
+    const total = await this.table!.countRows(where);
+    if (total > ADMIN_LIST_MAX_MATCHING) {
+      throw new Error(
+        `Too many matching rows (${total}). Narrow the time range or filters (max ${ADMIN_LIST_MAX_MATCHING}).`,
+      );
+    }
+    const rows = await this.table!
+      .query()
+      .where(where)
+      .select(["category", "createdAt", "agentId", "sessionId", "importance"])
+      .toArray();
+
+    const byKind = { user: 0, self: 0, full: 0, other: 0 };
+    const byCategory: Record<string, number> = {};
+    const agentCounts = new Map<string, number>();
+    const sessionCounts = new Map<string, number>();
+    const agentsSeen = new Set<string>();
+    const sessionsSeen = new Set<string>();
+    let impSum = 0;
+    let impN = 0;
+    const impB = { low: 0, mid: 0, high: 0 };
+
+    const fromMs = Math.floor(timeFromMs);
+    const toMs = Math.floor(timeToMs);
+    const span = Math.max(1, toMs - fromMs);
+    const HOUR = 3600000;
+    const DAY = 86400000;
+    const useHourly = span <= 48 * HOUR;
+    const wantMonthly = !useHourly && span > DASHBOARD_MAX_DAILY_SPAN_MS;
+    const monthSlots = wantMonthly ? localMonthsOverlappingRange(fromMs, toMs) : null;
+    const monthIndex = wantMonthly
+      ? new Map(monthSlots!.map((s, i) => [s.key, i] as const))
+      : null;
+
+    let bucketSize = DAY;
+    let nBuckets = 1;
+
+    if (useHourly) {
+      bucketSize = HOUR;
+      nBuckets = Math.min(60, Math.max(1, Math.ceil(span / HOUR)));
+    } else if (wantMonthly) {
+      nBuckets = monthSlots!.length;
+    } else {
+      bucketSize = DAY;
+      nBuckets = Math.max(1, Math.ceil(span / DAY));
+    }
+
+    const buckets = new Array<number>(nBuckets).fill(0);
+
+    for (const raw of rows as Array<Record<string, unknown>>) {
+      const cat = String(raw.category ?? "");
+      const createdAt = Number(raw.createdAt ?? 0);
+      const importance = Number(raw.importance ?? 0);
+      const ag = String(raw.agentId ?? "").trim();
+      const se = String(raw.sessionId ?? "").trim();
+
+      const k = memoryCategoryKind(cat);
+      byKind[k]++;
+
+      byCategory[cat] = (byCategory[cat] ?? 0) + 1;
+
+      if (ag) {
+        agentCounts.set(ag, (agentCounts.get(ag) ?? 0) + 1);
+        agentsSeen.add(ag);
+      }
+      if (se) {
+        sessionCounts.set(se, (sessionCounts.get(se) ?? 0) + 1);
+        sessionsSeen.add(se);
+      }
+
+      if (Number.isFinite(importance)) {
+        impSum += importance;
+        impN++;
+        if (importance < 0.34) {
+          impB.low++;
+        } else if (importance < 0.67) {
+          impB.mid++;
+        } else {
+          impB.high++;
+        }
+      }
+
+      if (wantMonthly) {
+        const bi = monthIndex!.get(localYearMonthKeyFromMs(createdAt));
+        if (bi !== undefined) {
+          buckets[bi]++;
+        }
+      } else {
+        const rel = createdAt - fromMs;
+        const bi = Math.floor(rel / bucketSize);
+        if (bi >= 0 && bi < nBuckets) {
+          buckets[bi]++;
+        }
+      }
+    }
+
+    const toBucketLabel = (ts: number): string => {
+      const d = new Date(ts);
+      if (useHourly) {
+        return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:00`;
+      }
+      return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+    };
+
+    const byBucket = wantMonthly
+      ? monthSlots!.map((s, i) => ({
+          key: s.key,
+          label: s.label,
+          count: buckets[i] ?? 0,
+        }))
+      : buckets.map((count, i) => ({
+          key: String(i),
+          label: toBucketLabel(fromMs + i * bucketSize),
+          count,
+        }));
+
+    const topFromMap = (m: Map<string, number>, n: number) =>
+      [...m.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, n)
+        .map(([agentId, count]) => ({ agentId, count }));
+
+    const topSessionsFromMap = (m: Map<string, number>, n: number) =>
+      [...m.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, n)
+        .map(([sessionId, count]) => ({ sessionId, count }));
+
+    return {
+      total: rows.length,
+      timeFromMs: fromMs,
+      timeToMs: toMs,
+      byKind,
+      byCategory,
+      byBucket,
+      topAgents: topFromMap(agentCounts, 10),
+      topSessions: topSessionsFromMap(sessionCounts, 10),
+      importance: {
+        low: impB.low,
+        mid: impB.mid,
+        high: impB.high,
+        avg: impN > 0 ? impSum / impN : 0,
+      },
+      uniqueAgents: agentsSeen.size,
+      uniqueSessions: sessionsSeen.size,
+    };
+  }
+
+  /**
+   * List rows for admin UI, paginated. Throws if match count > ADMIN_LIST_MAX_MATCHING.
+   * - user/self: sort by createdAt; sortDesc=true → 新→旧。
+   * - full: 按 batchId 分组；轮次间按 batch 时间 sortDesc；组内始终正序。
    */
   async listAdminFiltered(
     f: AdminListFilters,
     page: number,
     pageSize: number,
+    options?: { adminTab?: "user" | "self" | "full"; sortDesc?: boolean },
   ): Promise<{ total: number; items: MemoryEntry[] }> {
     await this.ensureInitialized();
     const where = buildAdminWhereClause(f);
@@ -235,10 +558,22 @@ export class MemoryDB {
         "isDeleted",
         "importance",
         "text",
+        "batchId",
+        "seqInBatch",
+        "contentHash",
+        "chunkIndex",
       ])
       .toArray();
     const entries = (rows as Array<Record<string, unknown>>).map((r) => rowToEntry(r));
-    entries.sort((a, b) => b.createdAt - a.createdAt);
+    const tab = options?.adminTab ?? "user";
+    const sortDesc = options?.sortDesc !== false;
+    if (tab === "full") {
+      sortFullContextAdminGrouped(entries, sortDesc);
+    } else if (sortDesc) {
+      entries.sort((a, b) => b.createdAt - a.createdAt);
+    } else {
+      entries.sort((a, b) => a.createdAt - b.createdAt);
+    }
     const p = Math.max(1, page);
     const ps = Math.max(1, Math.min(500, pageSize));
     const offset = (p - 1) * ps;
@@ -246,17 +581,17 @@ export class MemoryDB {
   }
 
   /**
-   * Distinct agentId / sessionId for dropdowns (time + deleted + categories only; no agent/session filter).
+   * Distinct agentId / sessionId for admin dropdowns (no agent/session filter).
+   * Pass **categories = []** to scan all non-deleted rows (recommended for facets: legacy `full_context_memory`, unknown categories).
+   * Non-empty categories adds `category IN (...)`.
    */
   async listAdminFacets(
     categories: MemoryCategory[],
     timeFromMs?: number,
     timeToMs?: number,
-    includeDeleted = false,
   ): Promise<{ agents: string[]; sessions: string[] }> {
     const f: AdminListFilters = {
       categories,
-      includeDeleted,
       timeFromMs,
       timeToMs,
     };
@@ -295,109 +630,134 @@ export class MemoryDB {
       category: MemoryCategory;
       userId?: string | null;
       sessionId?: string | null;
+      batchId?: string | null;
+      seqInBatch?: number | null;
+      contentHash?: string | null;
+      chunkIndex?: number | null;
     },
   ): Promise<MemoryEntry> {
-    await this.ensureInitialized();
-    const id = randomUUID();
-    const createdAt = Date.now();
-    const row = {
-      id,
-      agentId,
-      userId: normUserId(entry.userId),
-      sessionId: normSessionId(entry.sessionId),
-      text: entry.text,
-      vector: entry.vector,
-      importance: entry.importance,
-      category: entry.category,
-      createdAt,
-      isDeleted: 0,
-    };
-    await this.table!.add([row]);
-    return {
-      id,
-      agentId,
-      text: entry.text,
-      importance: entry.importance,
-      category: entry.category,
-      createdAt,
-    };
+    const [first] = await this.storeMany(agentId, [entry]);
+    return first;
   }
 
-  async storeOrUpdateFullContext(
+  /**
+   * Insert multiple vector rows (e.g. paragraph chunks). Each row gets a new id.
+   * `text` should be the full logical memory text on every row for recall/LLM context.
+   */
+  async storeMany(
     agentId: string,
-    sessionId: string | null,
-    entry: {
+    entries: ReadonlyArray<{
       text: string;
       vector: number[];
       importance: number;
       category: MemoryCategory;
       userId?: string | null;
-    },
-  ): Promise<{ action: "created" | "updated"; entry: MemoryEntry }> {
+      sessionId?: string | null;
+      batchId?: string | null;
+      seqInBatch?: number | null;
+      contentHash?: string | null;
+      chunkIndex?: number | null;
+    }>,
+  ): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
-    const sid = normSessionId(sessionId);
-    const a = sqlEscapeLiteral(agentId);
-    const c = sqlEscapeLiteral(String(entry.category));
-    const s = sqlEscapeLiteral(sid);
-    const where = `agentId = '${a}' AND category = '${c}' AND isDeleted = 0 AND sessionId = '${s}'`;
-    const rows = await this.table!.query().where(where).limit(1).toArray();
-    const createdAt = Date.now();
-    const textSafe = entry.text;
-    const userId = normUserId(entry.userId);
-
-    if (rows.length > 0) {
-      const existing = rows[0] as Record<string, unknown>;
-      const eid = String(existing.id ?? "");
-      const w = `id = '${sqlEscapeLiteral(eid)}' AND agentId = '${a}'`;
-      await this.table!.update({
-        where: w,
-        values: {
-          text: textSafe,
-          vector: entry.vector,
-          importance: entry.importance,
-          createdAt,
-          userId,
-        },
-      });
-      return {
-        action: "updated",
-        entry: {
-          id: eid,
-          agentId,
-          text: textSafe,
-          importance: entry.importance,
-          category: entry.category,
-          createdAt,
-        },
-      };
+    if (entries.length === 0) {
+      return [];
     }
-
-    const id = randomUUID();
-    await this.table!.add([
-      {
+    const createdAt = Date.now();
+    const rows: Array<Record<string, unknown>> = [];
+    const out: MemoryEntry[] = [];
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i]!;
+      const id = randomUUID();
+      const batchId =
+        entry.batchId != null && String(entry.batchId).trim() ? String(entry.batchId).trim() : "";
+      const seqInBatch =
+        typeof entry.seqInBatch === "number" && Number.isFinite(entry.seqInBatch)
+          ? Math.floor(entry.seqInBatch)
+          : 0;
+      const contentHash =
+        entry.contentHash != null && String(entry.contentHash).trim() ? String(entry.contentHash).trim() : "";
+      const chunkIndex =
+        typeof entry.chunkIndex === "number" && Number.isFinite(entry.chunkIndex)
+          ? Math.floor(entry.chunkIndex)
+          : i;
+      rows.push({
         id,
         agentId,
-        userId,
-        sessionId: sid,
-        text: textSafe,
+        userId: normUserId(entry.userId),
+        sessionId: normSessionId(entry.sessionId),
+        text: entry.text,
         vector: entry.vector,
         importance: entry.importance,
         category: entry.category,
         createdAt,
         isDeleted: 0,
-      },
-    ]);
-    return {
-      action: "created",
-      entry: {
+        batchId,
+        seqInBatch,
+        contentHash,
+        chunkIndex,
+      });
+      out.push({
         id,
         agentId,
-        text: textSafe,
+        text: entry.text,
         importance: entry.importance,
         category: entry.category,
         createdAt,
-      },
-    };
+        batchId: batchId || undefined,
+        seqInBatch,
+        contentHash: contentHash || undefined,
+        chunkIndex,
+      });
+    }
+    await this.table!.add(rows);
+    return out;
+  }
+
+  /** Skip duplicate hook/agent_end writes for the same session + hash. */
+  async existsByContentHash(agentId: string, sessionId: string, contentHash: string): Promise<boolean> {
+    const h = (contentHash ?? "").trim();
+    if (!h) {
+      return false;
+    }
+    await this.ensureInitialized();
+    const a = sqlEscapeLiteral(agentId);
+    const s = sqlEscapeLiteral(normSessionId(sessionId));
+    const hh = sqlEscapeLiteral(h);
+    const where = `agentId = '${a}' AND sessionId = '${s}' AND contentHash = '${hh}' AND isDeleted = 0`;
+    const rows = await this.table!.query().where(where).limit(1).toArray();
+    return rows.length > 0;
+  }
+
+  /**
+   * Vector search with multiple query embeddings; merge by logical key (contentHash if set, else row id), keep max score.
+   */
+  async searchMerged(
+    agentId: string,
+    vectors: number[][],
+    limit = 5,
+    minScore = 0.5,
+    categories?: MemoryCategory[],
+  ): Promise<MemorySearchResult[]> {
+    if (vectors.length === 0) {
+      return [];
+    }
+    const perVec = Math.max(1, limit * 2);
+    const merged = new Map<string, MemorySearchResult>();
+    for (const v of vectors) {
+      const hits = await this.search(agentId, v, perVec, minScore, categories);
+      for (const h of hits) {
+        const key =
+          h.entry.contentHash && String(h.entry.contentHash).length > 0
+            ? String(h.entry.contentHash)
+            : h.entry.id;
+        const prev = merged.get(key);
+        if (!prev || h.score > prev.score) {
+          merged.set(key, h);
+        }
+      }
+    }
+    return [...merged.values()].sort((a, b) => b.score - a.score).slice(0, limit);
   }
 
   async search(
@@ -437,27 +797,33 @@ export class MemoryDB {
     return results;
   }
 
-  async softDelete(agentId: string, id: string): Promise<boolean> {
-    if (!UUID_RE.test(id)) {
-      throw new Error(`Invalid memory ID format: ${id}`);
-    }
-    await this.ensureInitialized();
-    const w = `id = '${sqlEscapeLiteral(id)}' AND agentId = '${sqlEscapeLiteral(agentId)}'`;
-    const res = await this.table!.update({
-      where: w,
-      values: { isDeleted: 1 },
-    });
-    return (res.rowsUpdated ?? 0) > 0;
-  }
-
-  async softDeleteMany(items: ReadonlyArray<{ agentId: string; id: string }>): Promise<number> {
+  async deleteMany(items: ReadonlyArray<{ agentId: string; id: string }>): Promise<number> {
     let n = 0;
     for (const it of items) {
-      if (await this.softDelete(it.agentId, it.id)) {
+      if (await this.delete(it.agentId, it.id)) {
         n++;
       }
     }
     return n;
+  }
+
+  /** Delete all rows for the same logical memory (same agent, session, contentHash). */
+  async deleteByContentHash(
+    agentId: string,
+    sessionId: string | null | undefined,
+    contentHash: string,
+  ): Promise<number> {
+    const h = (contentHash ?? "").trim();
+    if (!h) {
+      return 0;
+    }
+    await this.ensureInitialized();
+    const a = sqlEscapeLiteral(agentId);
+    const s = sqlEscapeLiteral(normSessionId(sessionId));
+    const hh = sqlEscapeLiteral(h);
+    const pred = `agentId = '${a}' AND sessionId = '${s}' AND contentHash = '${hh}'`;
+    const res = await this.table!.delete(pred);
+    return res.numDeletedRows ?? 0;
   }
 
   async delete(agentId: string, id: string): Promise<boolean> {

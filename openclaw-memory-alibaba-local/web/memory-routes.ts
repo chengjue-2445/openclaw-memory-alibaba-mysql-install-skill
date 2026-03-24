@@ -9,13 +9,59 @@ import * as path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { MemoryCategory, MemoryConfig } from "../config.js";
 import {
+  FULL_CONTEXT_ASSISTANT,
+  FULL_CONTEXT_OTHERS,
   FULL_CONTEXT_SOURCE_CATEGORIES,
+  FULL_CONTEXT_SYSTEM,
+  FULL_CONTEXT_TOOL,
+  FULL_CONTEXT_TOOL_RESULT,
+  FULL_CONTEXT_USER,
+  MANUAL_INSERT_SESSION,
+  MEMORY_CATEGORY_LABEL_ZH,
   SELF_IMPROVING_CATEGORIES,
   USER_MEMORY_CATEGORIES,
 } from "../categories.js";
 import type { MemoryDB } from "../db.js";
 import type { AdminListFilters } from "../db.js";
 import { getMemoryPanelHtml } from "./memory-ui.js";
+
+const MANUAL_ADD_MAX_CHARS = 8000;
+
+export type MemoryPanelRoutesOpts = {
+  /** Required for POST /api/add (embedding). */
+  encodeForStorage?: (text: string) => Promise<{ chunks: string[]; vectors: number[][] }>;
+};
+
+function writableCategoriesForPanel(cfg: MemoryConfig): MemoryCategory[] {
+  const out: MemoryCategory[] = [...USER_MEMORY_CATEGORIES];
+  if (cfg.enableFullContextMemory) {
+    out.push(
+      FULL_CONTEXT_USER,
+      FULL_CONTEXT_ASSISTANT,
+      FULL_CONTEXT_SYSTEM,
+      FULL_CONTEXT_TOOL,
+      FULL_CONTEXT_TOOL_RESULT,
+      FULL_CONTEXT_OTHERS,
+    );
+  }
+  if (cfg.enableSelfImprovingMemory) {
+    out.push(...SELF_IMPROVING_CATEGORIES);
+  }
+  return out;
+}
+
+function buildPanelConfigPayload(cfg: MemoryConfig) {
+  return {
+    enableFullContextMemory: cfg.enableFullContextMemory,
+    enableSelfImprovingMemory: cfg.enableSelfImprovingMemory,
+    categoryLabelsZh: { ...MEMORY_CATEGORY_LABEL_ZH },
+    tabCategories: {
+      user: [...USER_MEMORY_CATEGORIES],
+      self: cfg.enableSelfImprovingMemory ? [...SELF_IMPROVING_CATEGORIES] : [],
+      full: cfg.enableFullContextMemory ? [...FULL_CONTEXT_SOURCE_CATEGORIES] : [],
+    },
+  };
+}
 
 export type RegisterHttpRoute = (params: {
   path: string;
@@ -107,6 +153,7 @@ export function registerMemoryPanelRoutes(
   db: MemoryDB,
   cfg: MemoryConfig,
   logger: PluginLogger,
+  opts?: MemoryPanelRoutesOpts | null,
 ): void {
   const requiredToken = resolveGatewayToken();
   const token = typeof requiredToken === "string" && requiredToken.length > 0 ? requiredToken : undefined;
@@ -119,8 +166,10 @@ export function registerMemoryPanelRoutes(
       try {
         const url = parseUrl(req);
         const p = url.pathname;
+        const isMemoryApi = p.startsWith("/plugins/memory/api/");
 
-        if (token) {
+        // HTML shell is public so the browser can load the panel; JSON APIs stay token-protected.
+        if (token && isMemoryApi) {
           const queryToken = (url.searchParams.get("token") ?? "").trim();
           const authHeader = (req.headers.authorization ?? req.headers.Authorization ?? "") as string;
           const bearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
@@ -130,7 +179,7 @@ export function registerMemoryPanelRoutes(
           }
         }
 
-        if (!p.startsWith("/plugins/memory/api/")) {
+        if (!isMemoryApi) {
           sendHtml(res, getMemoryPanelHtml());
           return true;
         }
@@ -149,25 +198,39 @@ export function registerMemoryPanelRoutes(
         }
 
         if (p === "/plugins/memory/api/config" && req.method === "GET") {
-          sendJson(res, 200, {
-            enableFullContextMemory: cfg.enableFullContextMemory,
-            enableSelfImprovingMemory: cfg.enableSelfImprovingMemory,
-          });
+          sendJson(res, 200, buildPanelConfigPayload(cfg));
           return true;
         }
 
         if (p === "/plugins/memory/api/facets" && req.method === "GET") {
-          const tab = url.searchParams.get("tab") || "user";
-          const cats = tabToCategories(tab, cfg);
-          const includeDeleted = url.searchParams.get("includeDeleted") === "1";
-          const timeFromMs = parseOptionalTimeMs(url.searchParams.get("timeFrom"));
-          const timeToMs = parseOptionalTimeMs(url.searchParams.get("timeTo"));
-          if (cats.length === 0) {
-            sendJson(res, 200, { agents: [], sessions: [] });
+          try {
+            // No category filter: include legacy `full_context_memory`, manual categories, and any future values.
+            // List API still filters by tab category; dropdowns only need distinct agentId/sessionId from real rows.
+            const facets = await db.listAdminFacets([], undefined, undefined);
+            sendJson(res, 200, facets);
+          } catch (e) {
+            sendJson(res, 400, { error: String(e) });
+          }
+          return true;
+        }
+
+        if (p === "/plugins/memory/api/dashboard" && req.method === "GET") {
+          const timeFromRaw = url.searchParams.get("timeFrom");
+          const timeToRaw = url.searchParams.get("timeTo");
+          const timeFromMs = parseOptionalTimeMs(timeFromRaw);
+          const timeToMs = parseOptionalTimeMs(timeToRaw);
+          if (timeFromMs === undefined || timeToMs === undefined) {
+            sendJson(res, 400, { error: "timeFrom and timeTo are required (ISO 8601)" });
             return true;
           }
-          const facets = await db.listAdminFacets(cats, timeFromMs, timeToMs, includeDeleted);
-          sendJson(res, 200, facets);
+          const agentId = (url.searchParams.get("agentId") ?? "").trim();
+          const sessionId = (url.searchParams.get("sessionId") ?? "").trim();
+          try {
+            const agg = await db.getAdminDashboardAggregates(timeFromMs, timeToMs, agentId, sessionId);
+            sendJson(res, 200, agg);
+          } catch (e) {
+            sendJson(res, 400, { error: String(e) });
+          }
           return true;
         }
 
@@ -184,7 +247,6 @@ export function registerMemoryPanelRoutes(
             sendJson(res, 200, { items: [], total: 0, page: 1, pageSize: 100 });
             return true;
           }
-          const includeDeleted = url.searchParams.get("includeDeleted") === "1";
           const timeFromMs = parseOptionalTimeMs(url.searchParams.get("timeFrom"));
           const timeToMs = parseOptionalTimeMs(url.searchParams.get("timeTo"));
           const page = Math.max(1, parseInt(url.searchParams.get("page") || "1", 10) || 1);
@@ -192,7 +254,6 @@ export function registerMemoryPanelRoutes(
 
           const filters: AdminListFilters = {
             categories: cats,
-            includeDeleted,
             timeFromMs,
             timeToMs,
           };
@@ -204,7 +265,12 @@ export function registerMemoryPanelRoutes(
           }
 
           try {
-            const { total, items } = await db.listAdminFiltered(filters, page, pageSize);
+            const sortDesc = url.searchParams.get("sortDesc") !== "false";
+            const adminTab = tab === "full" ? "full" : tab === "self" ? "self" : "user";
+            const { total, items } = await db.listAdminFiltered(filters, page, pageSize, {
+              adminTab,
+              sortDesc,
+            });
             sendJson(res, 200, {
               items,
               total,
@@ -217,7 +283,7 @@ export function registerMemoryPanelRoutes(
           return true;
         }
 
-        if (p === "/plugins/memory/api/soft-delete" && req.method === "POST") {
+        if (p === "/plugins/memory/api/delete" && req.method === "POST") {
           const raw = await readBody(req);
           let body: { items?: Array<{ agentId?: string; id?: string }> };
           try {
@@ -237,8 +303,74 @@ export function registerMemoryPanelRoutes(
             sendJson(res, 400, { error: "items required" });
             return true;
           }
-          const n = await db.softDeleteMany(normalized);
-          sendJson(res, 200, { updated: n });
+          const n = await db.deleteMany(normalized);
+          sendJson(res, 200, { deleted: n });
+          return true;
+        }
+
+        // Manual insert: embed once + db.store only. Skips storeOneCaptureItem, vector dedup, and conflict LLM.
+        if (p === "/plugins/memory/api/add" && req.method === "POST") {
+          const enc = opts?.encodeForStorage;
+          if (!enc) {
+            sendJson(res, 503, { error: "Embedding not configured; plugin needs embedding in config." });
+            return true;
+          }
+          const raw = await readBody(req);
+          let body: { agentId?: string; text?: string; category?: string };
+          try {
+            body = JSON.parse(raw || "{}") as typeof body;
+          } catch {
+            sendJson(res, 400, { error: "Invalid JSON" });
+            return true;
+          }
+          const agentId = (body.agentId ?? "").trim();
+          const textRaw = body.text == null ? "" : String(body.text);
+          const category = (body.category ?? "").trim() as MemoryCategory;
+          if (!agentId) {
+            sendJson(res, 400, { error: "agentId required" });
+            return true;
+          }
+          const text = textRaw.trim();
+          if (!text.length) {
+            sendJson(res, 400, { error: "text required" });
+            return true;
+          }
+          const allowed = new Set(writableCategoriesForPanel(cfg));
+          if (!allowed.has(category)) {
+            sendJson(res, 400, { error: "invalid or disabled category" });
+            return true;
+          }
+          const textForEmbed = text.length > MANUAL_ADD_MAX_CHARS ? text.slice(0, MANUAL_ADD_MAX_CHARS) : text;
+          let vectors: number[][];
+          try {
+            const out = await enc(textForEmbed);
+            vectors = out.vectors;
+          } catch (e) {
+            sendJson(res, 502, { error: `embed failed: ${String(e)}` });
+            return true;
+          }
+          if (vectors.length === 0) {
+            sendJson(res, 400, { error: "nothing to embed (empty after chunking)" });
+            return true;
+          }
+          const stored = await db.storeMany(
+            agentId,
+            vectors.map((vector, idx) => ({
+              text: textForEmbed,
+              vector,
+              importance: 1,
+              category,
+              userId: "",
+              sessionId: MANUAL_INSERT_SESSION,
+              seqInBatch: 0,
+              chunkIndex: idx,
+            })),
+          );
+          sendJson(res, 200, {
+            id: stored[0]!.id,
+            createdAt: stored[0]!.createdAt,
+            chunkRows: stored.length,
+          });
           return true;
         }
 

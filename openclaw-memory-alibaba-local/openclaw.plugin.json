@@ -4,7 +4,6 @@
   "description": "Local LanceDB long-term memory; user_memory_*, self_improving_*; DashScope-friendly defaults; table openclaw_memories_alibaba_local.",
   "configSchema": {
     "type": "object",
-    "required": ["embedding"],
     "additionalProperties": false,
     "properties": {
       "dbPath": {
@@ -14,13 +13,19 @@
       },
       "embedding": {
         "type": "object",
-        "required": ["apiKey"],
         "additionalProperties": false,
+        "description": "Omitted or {} → local llama-embedding. If apiKey/model/baseUrl/dimensions set without mode → remote (maxToken/dimensions default in plugin parse).",
         "properties": {
-          "apiKey": { "type": "string", "default": "" },
-          "model": { "type": "string", "default": "text-embedding-v3" },
-          "baseUrl": { "type": "string", "default": "https://dashscope.aliyuncs.com/compatible-mode/v1" },
-          "dimensions": { "type": "number", "default": 1024 }
+          "mode": { "type": "string", "enum": ["local", "remote"], "default": "local" },
+          "commandPrefix": {
+            "type": "string",
+            "description": "Shell command; stdin = text to embed. Default uses llama-embedding + -f /dev/stdin --embd-output-format json."
+          },
+          "dimensions": { "type": "number", "description": "768 default (local); 1024 default (remote) when omitted." },
+          "maxToken": { "type": "number", "description": "2048 default (remote) when omitted." },
+          "apiKey": { "type": "string" },
+          "model": { "type": "string" },
+          "baseUrl": { "type": "string" }
         }
       },
       "memory_duplication_conflict_process": {
@@ -31,7 +36,7 @@
       "llm": {
         "type": "object",
         "additionalProperties": false,
-        "description": "Required when memory_duplication_conflict_process or memoryExtractionMethod is llm.",
+        "description": "When LLM is required, each field can be omitted and filled from host openclaw.json: bailian apiKey/baseUrl and agents.defaults.model.primary (bailian/model → model id without prefix). Plugin values override file defaults.",
         "properties": {
           "apiKey": { "type": "string", "default": "" },
           "model": { "type": "string", "default": "qwen-plus" },
@@ -43,7 +48,7 @@
       "enableFullContextMemory": {
         "type": "boolean",
         "default": true,
-        "description": "When true (default), store full_context_* by role (upsert per session). Set false to disable."
+        "description": "When true (default), append full_context_* rows per message on agent_end (incremental cursor). Not used in vector recall."
       },
       "enableSelfImprovingMemory": {
         "type": "boolean",
@@ -54,7 +59,7 @@
         "type": "string",
         "enum": ["regex", "llm"],
         "default": "llm",
-        "description": "regex or llm; llm requires llm config."
+        "description": "regex or llm; llm needs apiKey+model (plugin llm and/or openclaw.json bailian + agents.defaults.model)."
       },
       "autoRecall": { "type": "boolean", "default": true },
       "autoCapture": { "type": "boolean", "default": true },
@@ -63,6 +68,16 @@
         "type": "boolean",
         "default": true,
         "description": "When true (default), recall uses time decay (30d half-life, exponential). Set false to disable."
+      },
+      "memoryDecayHalfLifeDays": {
+        "type": "number",
+        "default": 30,
+        "description": "Half-life in days for exponential/linear decay (1–3650)."
+      },
+      "memoryDecayStrategy": {
+        "type": "string",
+        "enum": ["exponential", "linear", "none"],
+        "default": "exponential"
       }
     }
   },
@@ -72,37 +87,53 @@
       "placeholder": "~/.openclaw/memory/lancedb",
       "help": "Same default as official memory-lancedb; table openclaw_memories_alibaba_local inside this directory."
     },
+    "embedding.mode": {
+      "label": "Embedding mode",
+      "help": "local: llama-embedding (stdin). remote: OpenAI-compatible HTTP (all remote fields required; first embed may fail if invalid)."
+    },
+    "embedding.commandPrefix": {
+      "label": "Local embed command",
+      "placeholder": "llama-embedding -m ~/.openclaw/... -f /dev/stdin --embd-output-format json",
+      "help": "Must read prompt from stdin; JSON output recommended for parsing."
+    },
     "embedding.apiKey": {
-      "label": "Embedding API Key",
+      "label": "Embedding API Key (remote)",
       "sensitive": true,
       "placeholder": "••••••••",
-      "help": "DashScope/OpenAI-compatible (supports ${DASHSCOPE_API_KEY})"
+      "help": "OpenAI-compatible /embeddings (${VAR} supported)"
     },
     "embedding.model": {
-      "label": "Embedding Model",
+      "label": "Embedding model (remote)",
       "placeholder": "text-embedding-v3"
     },
     "embedding.baseUrl": {
-      "label": "Embedding Base URL",
+      "label": "Embedding base URL (remote)",
       "placeholder": "https://dashscope.aliyuncs.com/compatible-mode/v1"
     },
     "embedding.dimensions": {
-      "label": "Embedding Dimensions",
-      "placeholder": "1024"
+      "label": "Embedding dimensions",
+      "placeholder": "768 or 1024"
+    },
+    "embedding.maxToken": {
+      "label": "Max tokens per chunk (approx)",
+      "placeholder": "2048",
+      "help": "Paragraphs exceeding this are split further (char length / 4)."
     },
     "llm.apiKey": {
       "label": "LLM API Key",
       "sensitive": true,
       "placeholder": "••••••••",
-      "help": "Required when memoryExtractionMethod is llm or conflict process is enabled"
+      "help": "If empty, uses models.providers.bailian.apiKey from openclaw.json when LLM is required"
     },
     "llm.model": {
       "label": "LLM Model",
-      "placeholder": "qwen-plus"
+      "placeholder": "qwen-plus",
+      "help": "If empty, uses agents.defaults.model.primary; bailian/name is normalized to name for Chat Completions"
     },
     "llm.baseUrl": {
       "label": "LLM Base URL",
-      "placeholder": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      "placeholder": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "help": "If empty, uses models.providers.bailian.baseUrl, else DashScope compatible default"
     },
     "memory_duplication_conflict_process": {
       "label": "Conflict / Dedup (LLM)",
@@ -119,7 +150,7 @@
     },
     "enableFullContextMemory": {
       "label": "Enable Full Context Memory",
-      "help": "Default on: per-role conversation snapshots per session. Turn off to skip full_context_* writes."
+      "help": "Default on: append one row per transcript message on agent_end (batchId + cursor). Not injected into recall."
     },
     "enableSelfImprovingMemory": {
       "label": "Enable Self-Improving Memory",

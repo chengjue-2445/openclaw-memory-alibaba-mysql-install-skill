@@ -33,8 +33,9 @@ Information to Extract (map each to exactly one category):
 
 Guidelines:
 - Store memories as clear, self-contained statements. Each memory should make sense on its own.
-- Use third person: "User prefers...", "User is working on...", not "I prefer...".
-- Include temporal context when relevant: "As of [date], user is working on...".
+- Language of the "text" field: match the user's language. If user messages are mainly in Chinese, write every "text" in concise natural Chinese (第三人称，如「用户偏好…」「用户正在…」). If mainly English, use English third person ("User prefers…"). Do not translate Chinese source into English for extraction.
+- Use third person: "User prefers...", "User is working on...", not "I prefer..." (or Chinese equivalents).
+- Include temporal context when relevant: "As of [date], user is working on..." (or 中文日期表述).
 - When information updates, prefer updating the existing memory rather than creating duplicates.
 - Preserve specificity: "User uses Next.js 14 with App Router" is better than "User uses React".
 - Capture the WHY behind preferences when stated: "User prefers Vim because of keyboard-driven workflow".
@@ -58,10 +59,10 @@ Importance (required for each extraction):
 export const USER_MEMORY_EXTRACTION_FORMAT = `
 
 Reply with ONLY a single JSON object, no other text or markdown. Use this exact structure:
-{"extractions":[{"category":"user_memory_fact"|"user_memory_preference"|"user_memory_decision","text":"one clear third-person statement","importance":0.0 to 1.0}]}
+{"extractions":[{"category":"user_memory_fact"|"user_memory_preference"|"user_memory_decision","text":"one clear third-person statement (中文若用户主要为中文)","importance":0.0 to 1.0}]}
 Every extraction MUST include "importance" (number 0–1). If nothing to remember, return: {"extractions":[]}
 
-User messages (extract from these):
+User messages (extract from these; write "text" in Chinese when these are in Chinese):
 `;
 
 /** Full prompt body (instructions + format). Caller appends the actual user messages. */

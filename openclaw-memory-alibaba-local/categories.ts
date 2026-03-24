@@ -80,3 +80,27 @@ export function isUserMemoryCategory(cat: string): cat is UserMemoryCategory {
 export function isSelfImprovingCategory(cat: string): cat is SelfImprovingCategory {
   return SELF_IMPROVING_CATEGORIES.includes(cat as SelfImprovingCategory);
 }
+
+/** Session id for rows inserted from the admin UI (manual add). */
+export const MANUAL_INSERT_SESSION = "manual_insert" as const;
+
+/** Chinese labels for admin UI and APIs (fixed mapping). */
+export const MEMORY_CATEGORY_LABEL_ZH: Readonly<Record<MemoryCategory, string>> = {
+  [USER_MEMORY_FACT]: "用户事实",
+  [USER_MEMORY_PREFERENCE]: "用户偏好",
+  [USER_MEMORY_DECISION]: "用户决策",
+  [FULL_CONTEXT_MEMORY]: "全文记忆",
+  [FULL_CONTEXT_USER]: "全文 · 用户消息",
+  [FULL_CONTEXT_ASSISTANT]: "全文 · AI助手消息",
+  [FULL_CONTEXT_SYSTEM]: "全文 · 系统消息",
+  [FULL_CONTEXT_TOOL]: "全文 · 工具调用",
+  [FULL_CONTEXT_TOOL_RESULT]: "全文 · 工具结果",
+  [FULL_CONTEXT_OTHERS]: "全文 · 其他消息",
+  [SELF_IMPROVING_LEARNINGS]: "最佳实践",
+  [SELF_IMPROVING_ERRORS]: "错误经验",
+  [SELF_IMPROVING_FEATURE_REQUESTS]: "行为诉求",
+};
+
+export function categoryLabelZh(category: string): string {
+  return MEMORY_CATEGORY_LABEL_ZH[category as MemoryCategory] ?? category;
+}
