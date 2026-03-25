@@ -19,6 +19,7 @@
   "files": [
     "index.ts",
     "prompt-strip.ts",
+    "bm25-recall.ts",
     "capture-state.ts",
     "config.ts",
     "db.ts",
