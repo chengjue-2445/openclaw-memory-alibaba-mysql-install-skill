@@ -53,7 +53,7 @@ import {
   saveAgentEndCursorMap,
 } from "./capture-state.js";
 import { LANCEDB_TABLE_NAME, MemoryDB } from "./db.js";
-import { registerMemoryPanelRoutes } from "./web/memory-routes.js";
+import { registerMemoryAdminGatewayMethods, registerMemoryPanelRoutes } from "./web/memory-routes.js";
 import type { MemoryEntry, MemorySearchResult } from "./db.js";
 import {
   buildUserMemoryExtractionPrompt,
@@ -1241,23 +1241,25 @@ const memoryPlugin = {
     const getDbAndBackend = (): { db: MemoryDB; backend: EmbeddingBackend } | null =>
       backend ? { db, backend } : null;
 
-    if (typeof api.registerHttpRoute === "function") {
-      registerMemoryPanelRoutes(
-        api.registerHttpRoute.bind(api),
-        db,
-        cfg,
-        api.logger,
-        backend
-          ? {
-              encodeForStorage: (text) => backend!.encodeForStorage(text),
-              vectorDim: db.getEmbeddingVectorDim(),
-            }
-          : {
-              vectorDim: db.getEmbeddingVectorDim(),
-            },
-      );
+    const memoryAdminOpts = backend
+      ? {
+          encodeForStorage: (text: string) => backend!.encodeForStorage(text),
+          vectorDim: db.getEmbeddingVectorDim(),
+        }
+      : {
+          vectorDim: db.getEmbeddingVectorDim(),
+        };
+
+    if (typeof api.registerGatewayMethod === "function") {
+      registerMemoryAdminGatewayMethods(api.registerGatewayMethod.bind(api), db, cfg, api.logger, memoryAdminOpts);
     } else {
-      api.logger.warn("openclaw-memory-alibaba-local: registerHttpRoute missing — /plugins/memory UI disabled");
+      api.logger.warn("openclaw-memory-alibaba-local: registerGatewayMethod missing — memory admin data API disabled");
+    }
+
+    if (typeof api.registerHttpRoute === "function") {
+      registerMemoryPanelRoutes(api.registerHttpRoute.bind(api), db, cfg, api.logger, memoryAdminOpts);
+    } else {
+      api.logger.warn("openclaw-memory-alibaba-local: registerHttpRoute missing — /plugins/memory HTML shell disabled");
     }
 
     // --- Tools: memory_recall, memory_store, memory_forget ---

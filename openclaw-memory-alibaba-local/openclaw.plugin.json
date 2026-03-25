@@ -19,7 +19,7 @@
           "mode": { "type": "string", "enum": ["local", "remote"], "default": "local" },
           "commandPrefix": {
             "type": "string",
-            "description": "Shell command; stdin = text to embed. Default uses llama-embedding + -f /dev/stdin --embd-output-format json."
+            "description": "Shell command; stdin = text to embed. Default uses llama-embedding +  --embd-output-format json."
           },
           "dimensions": { "type": "number", "description": "768 default (local); 1024 default (remote) when omitted." },
           "maxToken": { "type": "number", "description": "2048 default (remote) when omitted." },
@@ -136,7 +136,7 @@
     },
     "embedding.commandPrefix": {
       "label": "Local embed command",
-      "placeholder": "llama-embedding -m ~/.openclaw/... -f /dev/stdin --embd-output-format json",
+      "placeholder": "llama-embedding -m ~/.openclaw/... --embd-output-format json",
       "help": "Must read prompt from stdin; JSON output recommended for parsing."
     },
     "embedding.apiKey": {

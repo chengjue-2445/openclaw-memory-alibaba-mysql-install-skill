@@ -1,6 +1,6 @@
 {
   "name": "openclaw-memory-alibaba-local",
-  "version": "0.1.0",
+  "version": "0.1.6",
   "description": "OpenClaw memory plugin: local LanceDB + DashScope-compatible embeddings",
   "type": "module",
   "license": "MIT",
@@ -17,18 +17,8 @@
     "vector-search"
   ],
   "files": [
-    "index.ts",
-    "prompt-strip.ts",
-    "bm25-recall.ts",
-    "capture-state.ts",
-    "config.ts",
-    "db.ts",
-    "embed-chunks.ts",
-    "embedding-backend.ts",
-    "categories.ts",
-    "prompts.ts",
-    "web/memory-routes.ts",
-    "web/memory-ui.ts",
+    "*.ts",
+    "web/**/*.ts",
     "openclaw.plugin.json",
     "README.md"
   ],

@@ -13,7 +13,7 @@ export type EmbeddingBackend = {
 };
 
 const DEFAULT_LOCAL_PREFIX =
-  "llama-embedding -m ~/.openclaw/embedding_model/embeddinggemma-300M-Q8_0.gguf -f /dev/stdin --embd-output-format json ";
+  "llama-embedding -m ~/.openclaw/embedding_model/embeddinggemma-300M-Q8_0.gguf --embd-output-format json ";
 
 function expandTildeInCommandPrefix(prefix: string): string {
   const home = process.env.HOME || "";

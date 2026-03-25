@@ -1,77 +1,29 @@
 /**
- * Memory admin panel — /plugins/memory (HTML + JSON API).
- * Auth aligned with openclaw-observability: gateway.auth.token → ?token= or Bearer.
+ * Memory admin panel — /plugins/memory (HTML shell) + Gateway WebSocket RPC (memory.admin.*).
+ * Auth aligned with OpenClaw gateway: connect with gateway token + operator scopes (same as Control UI).
  */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { MemoryCategory, MemoryConfig } from "../config.js";
-import {
-  FULL_CONTEXT_ASSISTANT,
-  FULL_CONTEXT_MEMORY,
-  FULL_CONTEXT_OTHERS,
-  FULL_CONTEXT_SOURCE_CATEGORIES,
-  FULL_CONTEXT_SYSTEM,
-  FULL_CONTEXT_TOOL,
-  FULL_CONTEXT_TOOL_RESULT,
-  FULL_CONTEXT_USER,
-  MANUAL_INSERT_SESSION,
-  MEMORY_CATEGORY_LABEL_ZH,
-  SELF_IMPROVING_CATEGORIES,
-  USER_MEMORY_CATEGORIES,
-  isFullContextSourceCategory,
-} from "../categories.js";
+import type { GatewayRequestHandlerOptions, OpenClawPluginApi } from "openclaw/plugin-sdk/core";
+import type { MemoryConfig } from "../config.js";
 import type { MemoryDB } from "../db.js";
-import type { AdminListFilters } from "../db.js";
 import { getMemoryPanelHtml } from "./memory-ui.js";
+import {
+  opMemoryAdminAdd,
+  opMemoryAdminConfig,
+  opMemoryAdminDashboard,
+  opMemoryAdminDelete,
+  opMemoryAdminFacets,
+  opMemoryAdminList,
+  type AdminOpResult,
+  type MemoryAdminOpsContext,
+  type MemoryAdminOpsOpts,
+} from "./memory-admin-ops.js";
 
-const MANUAL_ADD_MAX_CHARS = 8000;
-
-export type MemoryPanelRoutesOpts = {
-  /** Required for POST /api/add when category needs real embeddings (user / self-improving). */
-  encodeForStorage?: (text: string) => Promise<{ chunks: string[]; vectors: number[][] }>;
-  /** LanceDB vector width; used for full_context_* manual add (zero placeholder, no embed). */
-  vectorDim?: number;
-};
-
-function categoryUsesRealEmbedding(category: MemoryCategory): boolean {
-  return category !== FULL_CONTEXT_MEMORY && !isFullContextSourceCategory(category);
-}
-
-function writableCategoriesForPanel(cfg: MemoryConfig): MemoryCategory[] {
-  const out: MemoryCategory[] = [...USER_MEMORY_CATEGORIES];
-  if (cfg.enableFullContextMemory) {
-    out.push(
-      FULL_CONTEXT_USER,
-      FULL_CONTEXT_ASSISTANT,
-      FULL_CONTEXT_SYSTEM,
-      FULL_CONTEXT_TOOL,
-      FULL_CONTEXT_TOOL_RESULT,
-      FULL_CONTEXT_OTHERS,
-    );
-  }
-  if (cfg.enableSelfImprovingMemory) {
-    out.push(...SELF_IMPROVING_CATEGORIES);
-  }
-  return out;
-}
-
-function buildPanelConfigPayload(cfg: MemoryConfig) {
-  return {
-    enableFullContextMemory: cfg.enableFullContextMemory,
-    enableSelfImprovingMemory: cfg.enableSelfImprovingMemory,
-    categoryLabelsZh: { ...MEMORY_CATEGORY_LABEL_ZH },
-    tabCategories: {
-      user: [...USER_MEMORY_CATEGORIES],
-      self: cfg.enableSelfImprovingMemory ? [...SELF_IMPROVING_CATEGORIES] : [],
-      full: cfg.enableFullContextMemory ? [...FULL_CONTEXT_SOURCE_CATEGORIES] : [],
-    },
-    /** 各 Tab 列表「记忆类型」筛选项（来自插件配置 + 默认中文名） */
-    memoryTypeFilterOptions: cfg.adminPanelMemoryTypeOptions,
-  };
-}
+export type MemoryPanelRoutesOpts = MemoryAdminOpsOpts;
 
 export type RegisterHttpRoute = (params: {
   path: string;
@@ -82,6 +34,8 @@ export type RegisterHttpRoute = (params: {
 }) => void;
 
 type PluginLogger = { info: (m: string) => void; warn: (m: string) => void };
+
+type RegisterGatewayMethod = OpenClawPluginApi["registerGatewayMethod"];
 
 function resolveGatewayToken(): string | undefined {
   const stateDir = process.env.OPENCLAW_STATE_DIR ?? path.join(os.homedir(), ".openclaw");
@@ -109,16 +63,6 @@ function resolveGatewayToken(): string | undefined {
   return undefined;
 }
 
-function tabToCategories(tab: string, cfg: MemoryConfig): MemoryCategory[] {
-  if (tab === "full") {
-    return cfg.enableFullContextMemory ? [...FULL_CONTEXT_SOURCE_CATEGORIES] : [];
-  }
-  if (tab === "self") {
-    return cfg.enableSelfImprovingMemory ? [...SELF_IMPROVING_CATEGORIES] : [];
-  }
-  return [...USER_MEMORY_CATEGORIES];
-}
-
 function parseUrl(req: IncomingMessage): URL {
   return new URL(req.url || "/", "http://" + (req.headers.host || "localhost"));
 }
@@ -140,24 +84,135 @@ function sendHtml(res: ServerResponse, html: string): void {
   res.end(html);
 }
 
-function readBody(req: IncomingMessage, maxBytes = 1024 * 64): Promise<string> {
+function applyAdminOpResult(respond: GatewayRequestHandlerOptions["respond"], result: AdminOpResult): void {
+  if (result.ok) {
+    respond(true, result.data);
+    return;
+  }
+  const msg =
+    typeof result.body.error === "string"
+      ? result.body.error
+      : JSON.stringify(result.body.error ?? result.body);
+  respond(false, { ...result.body, status: result.status }, { message: msg, code: `http_${result.status}` });
+}
+
+/** Gateway WebSocket methods: memory.admin.config | facets | dashboard | list | delete | add */
+export function registerMemoryAdminGatewayMethods(
+  registerGatewayMethod: RegisterGatewayMethod,
+  db: MemoryDB,
+  cfg: MemoryConfig,
+  logger: PluginLogger,
+  opts?: MemoryPanelRoutesOpts | null,
+): void {
+  const ctxBase: MemoryAdminOpsContext = {
+    db,
+    cfg,
+    opts: opts ?? undefined,
+  };
+
+  registerGatewayMethod("memory.admin.config", async ({ params, respond }) => {
+    void params;
+    try {
+      applyAdminOpResult(respond, await opMemoryAdminConfig(ctxBase));
+    } catch (e) {
+      logger.warn(`memory.admin.config: ${String(e)}`);
+      respond(false, { error: String(e) });
+    }
+  });
+
+  registerGatewayMethod("memory.admin.facets", async ({ params, respond }) => {
+    void params;
+    try {
+      applyAdminOpResult(respond, await opMemoryAdminFacets(ctxBase));
+    } catch (e) {
+      logger.warn(`memory.admin.facets: ${String(e)}`);
+      respond(false, { error: String(e) });
+    }
+  });
+
+  registerGatewayMethod("memory.admin.dashboard", async ({ params, respond }) => {
+    try {
+      applyAdminOpResult(respond, await opMemoryAdminDashboard(ctxBase, params ?? {}));
+    } catch (e) {
+      logger.warn(`memory.admin.dashboard: ${String(e)}`);
+      respond(false, { error: String(e) });
+    }
+  });
+
+  registerGatewayMethod("memory.admin.list", async ({ params, respond }) => {
+    try {
+      applyAdminOpResult(respond, await opMemoryAdminList(ctxBase, params ?? {}));
+    } catch (e) {
+      logger.warn(`memory.admin.list: ${String(e)}`);
+      respond(false, { error: String(e) });
+    }
+  });
+
+  registerGatewayMethod("memory.admin.delete", async ({ params, respond }) => {
+    try {
+      applyAdminOpResult(respond, await opMemoryAdminDelete(ctxBase, params ?? {}));
+    } catch (e) {
+      logger.warn(`memory.admin.delete: ${String(e)}`);
+      respond(false, { error: String(e) });
+    }
+  });
+
+  registerGatewayMethod("memory.admin.add", async ({ params, respond }) => {
+    try {
+      applyAdminOpResult(respond, await opMemoryAdminAdd(ctxBase, params ?? {}));
+    } catch (e) {
+      logger.warn(`memory.admin.add: ${String(e)}`);
+      respond(false, { error: String(e) });
+    }
+  });
+
+  logger.info("[openclaw-memory-alibaba-local] Memory admin Gateway methods: memory.admin.* (config, facets, dashboard, list, delete, add)");
+}
+
+async function readJsonBody(req: IncomingMessage, maxBytes = 2 * 1024 * 1024): Promise<string> {
   return new Promise((resolve, reject) => {
-    let data = "";
-    let bytes = 0;
+    const chunks: Buffer[] = [];
+    let n = 0;
     req.on("data", (chunk: Buffer) => {
-      bytes += chunk.length;
-      if (bytes > maxBytes) {
+      n += chunk.length;
+      if (n > maxBytes) {
         req.destroy();
         reject(new Error("body too large"));
         return;
       }
-      data += chunk.toString();
+      chunks.push(chunk);
     });
-    req.on("end", () => resolve(data));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     req.on("error", reject);
   });
 }
 
+async function dispatchMemoryAdminRpc(
+  ctx: MemoryAdminOpsContext,
+  method: string,
+  params: unknown,
+): Promise<AdminOpResult> {
+  switch (method) {
+    case "memory.admin.config":
+      return opMemoryAdminConfig(ctx);
+    case "memory.admin.facets":
+      return opMemoryAdminFacets(ctx);
+    case "memory.admin.dashboard":
+      return opMemoryAdminDashboard(ctx, (params as Record<string, unknown>) ?? {});
+    case "memory.admin.list":
+      return opMemoryAdminList(ctx, (params as Record<string, unknown>) ?? {});
+    case "memory.admin.delete":
+      return opMemoryAdminDelete(ctx, (params as Record<string, unknown>) ?? {});
+    case "memory.admin.add":
+      return opMemoryAdminAdd(ctx, (params as Record<string, unknown>) ?? {});
+    default:
+      return { ok: false, status: 404, body: { error: "unknown method", method } };
+  }
+}
+
+/**
+ * HTTP: HTML at /plugins/memory；同源 HTTP POST /plugins/memory/api/v1/call 供非本机访问（仅需 gateway token，不经 WS operator scope）。
+ */
 export function registerMemoryPanelRoutes(
   registerHttpRoute: RegisterHttpRoute,
   db: MemoryDB,
@@ -165,6 +220,11 @@ export function registerMemoryPanelRoutes(
   logger: PluginLogger,
   opts?: MemoryPanelRoutesOpts | null,
 ): void {
+  const ctxBase: MemoryAdminOpsContext = {
+    db,
+    cfg,
+    opts: opts ?? undefined,
+  };
   const requiredToken = resolveGatewayToken();
   const token = typeof requiredToken === "string" && requiredToken.length > 0 ? requiredToken : undefined;
 
@@ -178,237 +238,59 @@ export function registerMemoryPanelRoutes(
         const p = url.pathname;
         const isMemoryApi = p.startsWith("/plugins/memory/api/");
 
-        // HTML shell is public so the browser can load the panel; JSON APIs stay token-protected.
-        if (token && isMemoryApi) {
-          const queryToken = (url.searchParams.get("token") ?? "").trim();
-          const authHeader = (req.headers.authorization ?? req.headers.Authorization ?? "") as string;
-          const bearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
-          if (queryToken !== token && bearer !== token) {
-            sendJson(res, 401, { error: { message: "Unauthorized", type: "unauthorized" } });
-            return true;
-          }
-        }
-
-        if (!isMemoryApi) {
-          sendHtml(res, getMemoryPanelHtml());
-          return true;
-        }
-
-        const tryDb = async (): Promise<boolean> => {
-          try {
-            await db.ensureReady();
-            return true;
-          } catch (e) {
-            sendJson(res, 503, { error: "Database unavailable", detail: String(e) });
-            return false;
-          }
-        };
-        if (!(await tryDb())) {
-          return true;
-        }
-
-        if (p === "/plugins/memory/api/config" && req.method === "GET") {
-          sendJson(res, 200, buildPanelConfigPayload(cfg));
-          return true;
-        }
-
-        if (p === "/plugins/memory/api/facets" && req.method === "GET") {
-          try {
-            // No category filter: include legacy `full_context_memory`, manual categories, and any future values.
-            // List API still filters by tab category; dropdowns only need distinct agentId/sessionId from real rows.
-            const facets = await db.listAdminFacets([], undefined, undefined);
-            sendJson(res, 200, facets);
-          } catch (e) {
-            sendJson(res, 400, { error: String(e) });
-          }
-          return true;
-        }
-
-        if (p === "/plugins/memory/api/dashboard" && req.method === "GET") {
-          const timeFromRaw = url.searchParams.get("timeFrom");
-          const timeToRaw = url.searchParams.get("timeTo");
-          const timeFromMs = parseOptionalTimeMs(timeFromRaw);
-          const timeToMs = parseOptionalTimeMs(timeToRaw);
-          if (timeFromMs === undefined || timeToMs === undefined) {
-            sendJson(res, 400, { error: "timeFrom and timeTo are required (ISO 8601)" });
-            return true;
-          }
-          const agentId = (url.searchParams.get("agentId") ?? "").trim();
-          const sessionId = (url.searchParams.get("sessionId") ?? "").trim();
-          if (!agentId) {
-            sendJson(res, 400, { error: "缺少 agentId：请先选择 Agent" });
-            return true;
-          }
-          try {
-            const agg = await db.getAdminDashboardAggregates(timeFromMs, timeToMs, agentId, sessionId);
-            sendJson(res, 200, agg);
-          } catch (e) {
-            sendJson(res, 400, { error: String(e) });
-          }
-          return true;
-        }
-
-        if (p === "/plugins/memory/api/list" && req.method === "GET") {
-          const tab = url.searchParams.get("tab") || "user";
-          const agentId = (url.searchParams.get("agentId") ?? "").trim();
-          const sessionId = (url.searchParams.get("sessionId") ?? "").trim();
-          if (!agentId) {
-            sendJson(res, 400, { error: "缺少 agentId：请先选择 Agent" });
-            return true;
-          }
-          const baseCats = tabToCategories(tab, cfg);
-          if (baseCats.length === 0) {
-            sendJson(res, 200, { items: [], total: 0, page: 1, pageSize: 100 });
-            return true;
-          }
-          const timeFromMs = parseOptionalTimeMs(url.searchParams.get("timeFrom"));
-          const timeToMs = parseOptionalTimeMs(url.searchParams.get("timeTo"));
-          const page = Math.max(1, parseInt(url.searchParams.get("page") || "1", 10) || 1);
-          const pageSize = Math.min(500, Math.max(1, parseInt(url.searchParams.get("limit") || "100", 10) || 100));
-
-          const categoryOne = (url.searchParams.get("category") ?? "").trim();
-          let filterCats = baseCats;
-          if (categoryOne) {
-            if (!baseCats.includes(categoryOne as MemoryCategory)) {
-              sendJson(res, 400, { error: "category 与当前 Tab 不匹配" });
+        if (isMemoryApi) {
+          if (token) {
+            const queryToken = (url.searchParams.get("token") ?? "").trim();
+            const authHeader = (req.headers.authorization ?? req.headers.Authorization ?? "") as string;
+            const bearer = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+            if (queryToken !== token && bearer !== token) {
+              sendJson(res, 401, { error: { message: "Unauthorized", type: "unauthorized" } });
               return true;
             }
-            const listTab = tab === "full" ? "full" : tab === "self" ? "self" : "user";
-            const optList = cfg.adminPanelMemoryTypeOptions[listTab];
-            if (!optList.some((o) => o.category === categoryOne)) {
-              sendJson(res, 400, { error: "category 不在插件配置的记忆类型筛选项中" });
-              return true;
-            }
-            filterCats = [categoryOne as MemoryCategory];
           }
 
-          const filters: AdminListFilters = {
-            categories: filterCats,
-            timeFromMs,
-            timeToMs,
-          };
-          filters.agentId = agentId;
-          if (sessionId) {
-            filters.sessionId = sessionId;
-          }
-
-          try {
-            const sortDesc = url.searchParams.get("sortDesc") !== "false";
-            const adminTab = tab === "full" ? "full" : tab === "self" ? "self" : "user";
-            const { total, items } = await db.listAdminFiltered(filters, page, pageSize, {
-              adminTab,
-              sortDesc,
-            });
-            sendJson(res, 200, {
-              items,
-              total,
-              page,
-              pageSize,
-            });
-          } catch (e) {
-            sendJson(res, 400, { error: String(e) });
-          }
-          return true;
-        }
-
-        if (p === "/plugins/memory/api/delete" && req.method === "POST") {
-          const raw = await readBody(req);
-          let body: { items?: Array<{ agentId?: string; id?: string }> };
-          try {
-            body = JSON.parse(raw || "{}") as typeof body;
-          } catch {
-            sendJson(res, 400, { error: "Invalid JSON" });
-            return true;
-          }
-          const items = Array.isArray(body.items) ? body.items : [];
-          const normalized: { agentId: string; id: string }[] = [];
-          for (const it of items) {
-            if (it?.agentId && it?.id) {
-              normalized.push({ agentId: String(it.agentId), id: String(it.id) });
-            }
-          }
-          if (normalized.length === 0) {
-            sendJson(res, 400, { error: "items required" });
-            return true;
-          }
-          const n = await db.deleteMany(normalized);
-          sendJson(res, 200, { deleted: n });
-          return true;
-        }
-
-        // Manual insert: embed for user/self rows; full_context_* uses zero-vector placeholder (no embed).
-        if (p === "/plugins/memory/api/add" && req.method === "POST") {
-          const enc = opts?.encodeForStorage;
-          const vectorDim = typeof opts?.vectorDim === "number" && opts.vectorDim > 0 ? opts.vectorDim : 768;
-          const raw = await readBody(req);
-          let body: { agentId?: string; text?: string; category?: string };
-          try {
-            body = JSON.parse(raw || "{}") as typeof body;
-          } catch {
-            sendJson(res, 400, { error: "Invalid JSON" });
-            return true;
-          }
-          const agentId = (body.agentId ?? "").trim();
-          const textRaw = body.text == null ? "" : String(body.text);
-          const category = (body.category ?? "").trim() as MemoryCategory;
-          if (!agentId) {
-            sendJson(res, 400, { error: "agentId required" });
-            return true;
-          }
-          const text = textRaw.trim();
-          if (!text.length) {
-            sendJson(res, 400, { error: "text required" });
-            return true;
-          }
-          const allowed = new Set(writableCategoriesForPanel(cfg));
-          if (!allowed.has(category)) {
-            sendJson(res, 400, { error: "invalid or disabled category" });
-            return true;
-          }
-          const textForEmbed = text.length > MANUAL_ADD_MAX_CHARS ? text.slice(0, MANUAL_ADD_MAX_CHARS) : text;
-          const needsRealEmbed = categoryUsesRealEmbedding(category);
-          if (needsRealEmbed && !enc) {
-            sendJson(res, 503, { error: "Embedding not configured; plugin needs embedding in config." });
-            return true;
-          }
-          let vectors: number[][];
-          if (needsRealEmbed) {
+          if (p === "/plugins/memory/api/v1/call" && req.method === "POST") {
+            let raw: string;
             try {
-              const out = await enc!(textForEmbed);
-              vectors = out.vectors;
+              raw = await readJsonBody(req);
+            } catch {
+              sendJson(res, 400, { error: "invalid body" });
+              return true;
+            }
+            let body: { method?: string; params?: unknown };
+            try {
+              body = JSON.parse(raw || "{}") as { method?: string; params?: unknown };
+            } catch {
+              sendJson(res, 400, { error: "invalid json" });
+              return true;
+            }
+            const method = typeof body.method === "string" ? body.method.trim() : "";
+            if (!method) {
+              sendJson(res, 400, { error: "missing method" });
+              return true;
+            }
+            try {
+              const result = await dispatchMemoryAdminRpc(ctxBase, method, body.params ?? {});
+              if (result.ok) {
+                sendJson(res, 200, result.data as unknown);
+              } else {
+                sendJson(res, result.status, { ...result.body, status: result.status });
+              }
             } catch (e) {
-              sendJson(res, 502, { error: `embed failed: ${String(e)}` });
-              return true;
+              logger.warn(`memory api/v1/call ${method}: ${String(e)}`);
+              sendJson(res, 500, { error: String(e) });
             }
-            if (vectors.length === 0) {
-              sendJson(res, 400, { error: "nothing to embed (empty after chunking)" });
-              return true;
-            }
-          } else {
-            vectors = [Array.from({ length: vectorDim }, () => 0)];
+            return true;
           }
-          const stored = await db.storeMany(
-            agentId,
-            vectors.map((vector, idx) => ({
-              text: textForEmbed,
-              vector,
-              importance: 1,
-              category,
-              userId: "",
-              sessionId: MANUAL_INSERT_SESSION,
-              seqInBatch: 0,
-              chunkIndex: idx,
-            })),
-          );
-          sendJson(res, 200, {
-            id: stored[0]!.id,
-            createdAt: stored[0]!.createdAt,
-            chunkRows: stored.length,
+
+          sendJson(res, 404, {
+            error: "not found",
+            detail: "POST /plugins/memory/api/v1/call with JSON { method, params } (same as memory.admin.* WebSocket RPC)",
           });
           return true;
         }
 
-        sendJson(res, 404, { error: "Not found" });
+        sendHtml(res, getMemoryPanelHtml());
         return true;
       } catch (err) {
         logger.warn(`openclaw-memory-alibaba-local memory panel: ${String(err)}`);
@@ -418,16 +300,7 @@ export function registerMemoryPanelRoutes(
     },
   });
 
-  logger.info("[openclaw-memory-alibaba-local] Memory admin UI at /plugins/memory/");
-}
-
-function parseOptionalTimeMs(iso: string | null): number | undefined {
-  if (!iso) {
-    return undefined;
-  }
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) {
-    return undefined;
-  }
-  return t;
+  logger.info(
+    "[openclaw-memory-alibaba-local] Memory admin UI at /plugins/memory/ (WS memory.admin.* on loopback; HTTP POST .../api/v1/call for remote)",
+  );
 }

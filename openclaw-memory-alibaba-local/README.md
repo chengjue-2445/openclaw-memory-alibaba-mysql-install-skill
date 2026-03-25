@@ -42,7 +42,7 @@ OpenClaw 记忆插件：**本地 LanceDB** 向量存储。支持用户记忆三�
 }
 ```
 
-可选 **`local`** 字段：`commandPrefix`（默认使用 `llama-embedding -m ~/.openclaw/embedding_model/embeddinggemma-300M-Q8_0.gguf -f /dev/stdin --embd-output-format json`）、`dimensions`（默认 **768**）、`maxToken`（默认 **2048**）。命令需从 **stdin** 读入待嵌入文本；推荐使用 **`--embd-output-format json`**（与 OpenAI 列表格式兼容）。
+可选 **`local`** 字段：`commandPrefix`（默认使用 `llama-embedding -m ~/.openclaw/embedding_model/embeddinggemma-300M-Q8_0.gguf  --embd-output-format json`）、`dimensions`（默认 **768**）、`maxToken`（默认 **2048**）。命令需从 **stdin** 读入待嵌入文本；推荐使用 **`--embd-output-format json`**（与 OpenAI 列表格式兼容）。
 
 ## 远程 embedding（OpenAI 兼容）
 

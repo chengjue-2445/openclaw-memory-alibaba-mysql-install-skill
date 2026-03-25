@@ -797,9 +797,21 @@ function buildClientScript(): string {
   // 外层是模板字符串反引号：内层不要用 \ 转义双引号，否则生成到浏览器里的 JS 会断串（例如 class="mono"）。
   const s = `
 (function () {
+  // 与 rds-claw-observability-plugin 一致：127.0.0.1 与 localhost 在网关 Control UI / WS 策略上不等价，统一跳到 localhost。
+  try {
+    if (window.location.hostname === "127.0.0.1") {
+      var _ocRedir =
+        window.location.protocol +
+        "//localhost" +
+        (window.location.port ? ":" + window.location.port : "") +
+        window.location.pathname +
+        window.location.search +
+        window.location.hash;
+      window.location.replace(_ocRedir);
+    }
+  } catch (_ocRedirErr) {}
+
   var LS_TOKEN_KEY = "openclaw_memory_gateway_token";
-  /** Plugin routes are fixed; do not derive from pathname ("/" 首页或 hash 路由会错成 /api)。 */
-  var API_BASE = "/plugins/memory/api";
 
   function readTokenFromQueryString(qs) {
     if (!qs || qs.charAt(0) !== "?") {
@@ -809,12 +821,60 @@ function buildClientScript(): string {
     return t && String(t).trim() ? String(t).trim() : "";
   }
 
+  /** 与观测插件一致：支持 JSON 包一层 token / gatewayToken / settings.* */
+  function tryTokenFromJsonString(raw) {
+    if (!raw || typeof raw !== "string") {
+      return "";
+    }
+    var st = raw.trim();
+    if (!st) {
+      return "";
+    }
+    if (st.charAt(0) === "{") {
+      try {
+        var obj = JSON.parse(st);
+        if (obj && typeof obj === "object") {
+          if (typeof obj.token === "string" && obj.token.trim()) {
+            return obj.token.trim();
+          }
+          if (typeof obj.gatewayToken === "string" && obj.gatewayToken.trim()) {
+            return obj.gatewayToken.trim();
+          }
+          if (obj.settings && typeof obj.settings === "object") {
+            if (typeof obj.settings.token === "string" && obj.settings.token.trim()) {
+              return obj.settings.token.trim();
+            }
+            if (typeof obj.settings.gatewayToken === "string" && obj.settings.gatewayToken.trim()) {
+              return obj.settings.gatewayToken.trim();
+            }
+          }
+        }
+      } catch (e) {}
+    }
+    return st;
+  }
+
+  function readTokenFromStorage(storage, key) {
+    try {
+      if (!storage || typeof storage.getItem !== "function") {
+        return "";
+      }
+      return tryTokenFromJsonString(storage.getItem(key) || "");
+    } catch (e) {
+      return "";
+    }
+  }
+
+  function persistToken(t) {
+    try {
+      localStorage.setItem(LS_TOKEN_KEY, t);
+    } catch (e) {}
+  }
+
   function getGatewayToken() {
     var fromSearch = readTokenFromQueryString(window.location.search);
     if (fromSearch) {
-      try {
-        localStorage.setItem(LS_TOKEN_KEY, fromSearch);
-      } catch (e) {}
+      persistToken(fromSearch);
       return fromSearch;
     }
     var hash = window.location.hash || "";
@@ -822,56 +882,340 @@ function buildClientScript(): string {
     if (qm >= 0) {
       var fromHash = readTokenFromQueryString(hash.slice(qm));
       if (fromHash) {
-        try {
-          localStorage.setItem(LS_TOKEN_KEY, fromHash);
-        } catch (e) {}
+        persistToken(fromHash);
         return fromHash;
       }
     }
+    var ocKeys = [
+      "openclaw.control.token.v1",
+      "openclaw.control.settings.v1",
+      "openclaw.gateway.token",
+      "gateway.token",
+      "gatewayToken",
+      "token"
+    ];
+    var i;
+    for (i = 0; i < ocKeys.length; i++) {
+      var tk = readTokenFromStorage(window.localStorage, ocKeys[i]);
+      if (tk) {
+        persistToken(tk);
+        return tk;
+      }
+      tk = readTokenFromStorage(window.sessionStorage, ocKeys[i]);
+      if (tk) {
+        persistToken(tk);
+        return tk;
+      }
+    }
     try {
-      var s = localStorage.getItem(LS_TOKEN_KEY);
-      return s && String(s).trim() ? String(s).trim() : "";
+      var legacy = localStorage.getItem(LS_TOKEN_KEY);
+      legacy = legacy ? tryTokenFromJsonString(legacy) : "";
+      return legacy && String(legacy).trim() ? String(legacy).trim() : "";
     } catch (e) {
       return "";
     }
   }
 
-  function withAuth(url) {
-    var u = url.indexOf("?") >= 0 ? url + "&" : url + "?";
-    var tok = getGatewayToken();
-    if (tok) {
-      u += "token=" + encodeURIComponent(tok) + "&";
+  function gatewayWsUrl() {
+    return (location.protocol === "https:" ? "wss:" : "ws:") + "//" + location.host;
+  }
+
+  /** 与网关 isLocalClient 一致：仅这些主机用 Control UI 客户端 + allowInsecureAuth 即可；其它主机需 probe + dangerouslyDisableDeviceAuth 等 */
+  function isMemoryPanelLoopbackHost() {
+    var h = (location.hostname || "").toLowerCase();
+    return h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "[::1]";
+  }
+
+  function gatewayPanelConnectClient() {
+    if (isMemoryPanelLoopbackHost()) {
+      return { id: "openclaw-control-ui", mode: "ui" };
     }
-    return u.replace(/[&?]$/, "").replace("?&", "?");
+    return { id: "openclaw-probe", mode: "probe" };
   }
 
-  /** 避免页面带 <base href> 时相对路径跑偏；网关层也认 Bearer。 */
-  function memoryApiAbsolute(pathWithLeadingSlash) {
-    var p = pathWithLeadingSlash.charAt(0) === "/" ? pathWithLeadingSlash : "/" + pathWithLeadingSlash;
-    return window.location.origin + API_BASE + p;
+  function hintGatewayControlUiInsecureAuth() {
+    if (isMemoryPanelLoopbackHost()) {
+      return (
+        " 解决办法：编辑 ~/.openclaw/openclaw.json，在 gateway.controlUi 中加入 \\"allowInsecureAuth\\": true，保存后执行 openclaw gateway restart，再刷新本页。" +
+        " 请用 http://localhost 打开本机面板（从 127.0.0.1 访问会自动跳转）；不要用局域网 IP，除非按下文配置。"
+      );
+    }
+    return (
+      " 解决办法（任选其一）：(1) 用本机浏览器打开 http://127.0.0.1:<网关端口>/plugins/memory?token=…，并设置 gateway.controlUi.allowInsecureAuth 为 true；" +
+      "(2) 若必须从其它机器/局域网 IP 访问，在 gateway.controlUi 设置 \\"dangerouslyDisableDeviceAuth\\": true 后重启 gateway（会降低设备绑定安全策略）；" +
+      "(3) 使用 HTTPS 并完成网关设备配对。"
+    );
   }
 
-  function authFetchHeaders(base) {
-    var h = {};
-    if (base) {
-      for (var k in base) {
-        if (Object.prototype.hasOwnProperty.call(base, k)) {
-          h[k] = base[k];
+  var gwState = {
+    ws: null,
+    pending: new Map(),
+    phase: "off",
+    connectPromise: null,
+    reqSeq: 0,
+    connectResolve: null,
+    connectReject: null
+  };
+
+  function gwNextId() {
+    gwState.reqSeq += 1;
+    return "m" + gwState.reqSeq + "-" + Date.now();
+  }
+
+  function gwFailAllPending(err) {
+    gwState.pending.forEach(function (fn) {
+      try {
+        fn({ ok: false, error: { message: String(err && err.message ? err.message : err) } });
+      } catch (e) {}
+    });
+    gwState.pending.clear();
+  }
+
+  function gwOnMessage(ev) {
+    var msg;
+    try {
+      msg = JSON.parse(ev.data);
+    } catch (e) {
+      return;
+    }
+    if (gwState.phase === "wait-challenge") {
+      if (msg.type === "event" && msg.event === "connect.challenge") {
+        gwState.phase = "wait-connect-res";
+        var cid = gwNextId();
+        var tok = getGatewayToken();
+        gwState.pending.set(cid, function (resMsg) {
+          if (!resMsg.ok) {
+            gwState.phase = "failed";
+            var em = (resMsg.error && resMsg.error.message) ? String(resMsg.error.message) : "connect failed";
+            if (gwState.connectReject) gwState.connectReject(new Error(em));
+            return;
+          }
+          gwState.phase = "ready";
+          if (gwState.connectResolve) gwState.connectResolve();
+        });
+        var gwc = gatewayPanelConnectClient();
+        gwState.ws.send(
+          JSON.stringify({
+            type: "req",
+            id: cid,
+            method: "connect",
+            params: {
+              minProtocol: 3,
+              maxProtocol: 3,
+              client: {
+                id: gwc.id,
+                version: "memory-panel",
+                platform: typeof navigator !== "undefined" && navigator.platform ? navigator.platform : "web",
+                mode: gwc.mode
+              },
+              role: "operator",
+              scopes: ["operator.admin"],
+              auth: tok ? { token: tok } : {}
+            }
+          })
+        );
+      }
+      return;
+    }
+    if (msg.type === "res" && gwState.pending.has(msg.id)) {
+      var fn = gwState.pending.get(msg.id);
+      gwState.pending.delete(msg.id);
+      fn(msg);
+    }
+  }
+
+  function ensureGatewayConnected() {
+    if (gwState.phase === "ready" && gwState.ws && gwState.ws.readyState === 1) {
+      return Promise.resolve();
+    }
+    if (gwState.connectPromise) {
+      return gwState.connectPromise;
+    }
+    if (gwState.ws) {
+      try {
+        gwState.ws.close();
+      } catch (e) {}
+      gwState.ws = null;
+    }
+    gwState.phase = "wait-challenge";
+    gwState.pending.clear();
+    gwState.connectPromise = new Promise(function (resolve, reject) {
+      gwState.connectResolve = resolve;
+      gwState.connectReject = reject;
+      try {
+        gwState.ws = new WebSocket(gatewayWsUrl());
+      } catch (e) {
+        gwState.phase = "failed";
+        gwState.connectPromise = null;
+        reject(e);
+        return;
+      }
+      gwState.ws.onmessage = gwOnMessage;
+      gwState.ws.onerror = function () {
+        if (gwState.phase !== "ready") {
+          gwState.phase = "failed";
+          gwState.connectPromise = null;
+          if (gwState.connectReject) gwState.connectReject(new Error("WebSocket error"));
+        }
+      };
+      gwState.ws.onclose = function () {
+        var wasReady = gwState.phase === "ready";
+        gwState.phase = "off";
+        gwState.ws = null;
+        gwState.connectPromise = null;
+        if (wasReady) {
+          gwFailAllPending(new Error("WebSocket closed"));
+        }
+      };
+    });
+    return gwState.connectPromise.finally(function () {
+      gwState.connectPromise = null;
+      gwState.connectResolve = null;
+      gwState.connectReject = null;
+    });
+  }
+
+  function gatewayRpc(method, params) {
+    return ensureGatewayConnected().then(function () {
+      return new Promise(function (resolve, reject) {
+        if (!gwState.ws || gwState.ws.readyState !== 1) {
+          reject(new Error("WebSocket not open"));
+          return;
+        }
+        var id = gwNextId();
+        gwState.pending.set(id, function (msg) {
+          if (msg.ok) {
+            resolve({ ok: true, data: msg.payload });
+          } else {
+            var em = msg.error && msg.error.message ? String(msg.error.message) : "rpc error";
+            var low = em.toLowerCase();
+            var unauth =
+              low.indexOf("unauthorized") >= 0 ||
+              low.indexOf("token mismatch") >= 0 ||
+              low.indexOf("token missing") >= 0 ||
+              low.indexOf("missing scope") >= 0;
+            resolve({ ok: false, unauthorized: unauth, message: em, payload: msg.payload });
+          }
+        });
+        gwState.ws.send(JSON.stringify({ type: "req", id: id, method: method, params: params || {} }));
+      });
+    });
+  }
+
+  /**
+   * 非本机 hostname（公网 IP / 域名）时 Gateway WebSocket 会剥离 operator.admin；同源 HTTP 仅需 gateway token（与观测插件一致）。
+   */
+  async function fetchMemoryApiHttp(method, params) {
+    var tok = getGatewayToken();
+    var headers = { "Content-Type": "application/json" };
+    if (tok) {
+      headers["Authorization"] = "Bearer " + tok;
+    }
+    var resp;
+    try {
+      resp = await fetch("/plugins/memory/api/v1/call", {
+        method: "POST",
+        headers: headers,
+        body: JSON.stringify({ method: method, params: params || {} })
+      });
+    } catch (e) {
+      return {
+        ok: false,
+        status: 0,
+        json: function () {
+          return Promise.resolve({ error: String(e) });
+        },
+        text: function () {
+          return Promise.resolve(String(e));
+        }
+      };
+    }
+    var j;
+    try {
+      j = await resp.json();
+    } catch (e2) {
+      j = { error: "invalid JSON response" };
+    }
+    if (resp.ok) {
+      return {
+        ok: true,
+        status: 200,
+        json: function () {
+          return Promise.resolve(j);
+        },
+        text: function () {
+          return Promise.resolve("");
+        }
+      };
+    }
+    var st = resp.status;
+    if (j && typeof j.status === "number" && Number.isFinite(j.status)) {
+      st = j.status;
+    }
+    return {
+      ok: false,
+      status: st,
+      json: function () {
+        return Promise.resolve(j);
+      },
+      text: function () {
+        return Promise.resolve(String((j && j.error) || resp.status));
+      }
+    };
+  }
+
+  /** 与原先 fetch 类似的接口：ok / status / json() / text() */
+  async function fetchMemoryApi(method, params) {
+    var p = params || {};
+    if (!isMemoryPanelLoopbackHost()) {
+      return fetchMemoryApiHttp(method, p);
+    }
+    try {
+      var res = await gatewayRpc(method, p);
+      if (res.ok) {
+        return {
+          ok: true,
+          status: 200,
+          json: function () {
+            return Promise.resolve(res.data);
+          },
+          text: function () {
+            return Promise.resolve("");
+          }
+        };
+      }
+      if (res.unauthorized) {
+        var httpRes = await fetchMemoryApiHttp(method, p);
+        if (httpRes.ok) {
+          return httpRes;
         }
       }
+      var st = res.payload && res.payload.status ? parseInt(String(res.payload.status), 10) : 0;
+      if (!Number.isFinite(st) || st < 400) {
+        st = res.unauthorized ? 403 : 502;
+      }
+      return {
+        ok: false,
+        status: st,
+        json: function () {
+          return Promise.resolve(res.payload && (res.payload.error || res.payload) ? res.payload : { error: res.message });
+        },
+        text: function () {
+          return Promise.resolve(res.message || "");
+        }
+      };
+    } catch (e) {
+      return {
+        ok: false,
+        status: 0,
+        json: function () {
+          return Promise.resolve({ error: String(e) });
+        },
+        text: function () {
+          return Promise.resolve(String(e));
+        }
+      };
     }
-    var tok = getGatewayToken();
-    if (tok) {
-      h["Authorization"] = "Bearer " + tok;
-    }
-    return h;
-  }
-
-  function fetchMemoryApi(pathWithLeadingSlash, init) {
-    var url = withAuth(memoryApiAbsolute(pathWithLeadingSlash));
-    var o = init ? Object.assign({}, init) : {};
-    o.headers = authFetchHeaders(o.headers || {});
-    return fetch(url, o);
   }
 
   function showBanner(kind, msg) {
@@ -997,35 +1341,28 @@ function buildClientScript(): string {
     };
   }
 
-  function facetQueryPath() {
-    var q = new URLSearchParams();
-    q.set("tab", state.tab);
-    return "/facets?" + q.toString();
-  }
-
-  function listQueryPath(page, tr) {
+  function listQueryParams(page, tr) {
     var t = tr != null ? tr : readTimeRange();
     if (t.error) {
       return t;
     }
-    var q = new URLSearchParams();
-    q.set("tab", state.tab);
     var aid = state.selectedAgentId.trim();
     var sid = state.selectedSessionId.trim();
-    q.set("agentId", aid);
-    if (sid) q.set("sessionId", sid);
-    q.set("timeFrom", t.timeFrom);
-    q.set("timeTo", t.timeTo);
-    q.set("page", String(page || 1));
-    q.set("limit", String(state.pageSize));
     var ord = document.getElementById("sortOrder");
-    var sortDesc = ord && ord.value === "desc";
-    q.set("sortDesc", sortDesc ? "true" : "false");
+    var sortDesc = !!(ord && ord.value === "desc");
     var catF = state.categoryFilterByTab[state.tab] || "";
-    if (catF) {
-      q.set("category", catF);
-    }
-    return { path: "/list?" + q.toString() };
+    var o = {
+      tab: state.tab,
+      agentId: aid,
+      timeFrom: t.timeFrom,
+      timeTo: t.timeTo,
+      page: page || 1,
+      limit: state.pageSize,
+      sortDesc: sortDesc
+    };
+    if (sid) o.sessionId = sid;
+    if (catF) o.category = catF;
+    return { params: o };
   }
 
   function syncMemoryTypeFilterSelect() {
@@ -1096,10 +1433,38 @@ function buildClientScript(): string {
   }
 
   async function loadConfig() {
-    var r = await fetchMemoryApi("/config");
+    var r = await fetchMemoryApi("memory.admin.config", {});
     if (!r.ok) {
-      if (r.status === 401) {
-        throw new Error("未授权：请在 URL 使用 ?token=（与 ~/.openclaw/openclaw.json 中 gateway.auth.token 一致），hash 路由可用 #/path?token=；成功一次后会写入本机 localStorage。");
+      if (r.status === 401 || r.status === 403) {
+        var detailAuth = await r.json().catch(function () {
+          return {};
+        });
+        var errLow = String(detailAuth.error || "").toLowerCase();
+        var hintScope =
+          r.status === 403 && errLow.indexOf("scope") >= 0
+            ? isMemoryPanelLoopbackHost()
+              ? " 已通过 token 连接但仍缺少 scope：请在 openclaw.json 的 gateway.controlUi 设置 allowInsecureAuth: true（回环访问），保存后重启 gateway。"
+              : " 已通过 token 连接但仍缺少 scope：非本机 hostname 访问时请设置 gateway.controlUi.dangerouslyDisableDeviceAuth: true，或改用 http://127.0.0.1 打开面板并配合 allowInsecureAuth: true；保存后重启 gateway。"
+            : "";
+        throw new Error(
+          (r.status === 401
+            ? "未授权：请在 URL 使用 ?token=（与 ~/.openclaw/openclaw.json 中 gateway.auth.token 一致），hash 路由可用 #/path?token=；面板通过 WebSocket 连接网关时会在 connect 中携带该 token。成功一次后会写入本机 localStorage。"
+            : "拒绝访问：" + (detailAuth.error ? String(detailAuth.error) : (await r.text().catch(function () { return ""; }))) + hintScope)
+        );
+      }
+      if (r.status === 0) {
+        var detail0 = await r.json().catch(function () {
+          return {};
+        });
+        var msg0 = detail0 && detail0.error != null ? String(detail0.error) : await r.text().catch(function () { return ""; });
+        var low0 = msg0.toLowerCase();
+        var hintHandshake =
+          low0.indexOf("device identity") >= 0 || low0.indexOf("control ui") >= 0 ? hintGatewayControlUiInsecureAuth() : "";
+        throw new Error(
+          msg0
+            ? "无法连接网关 WebSocket 或握手失败：" + msg0 + hintHandshake
+            : "无法连接网关 WebSocket（请确认网关已启动、页面与网关同源，且 token 正确）。仍失败请查看 gateway 日志。"
+        );
       }
       throw new Error("config " + r.status);
     }
@@ -1446,16 +1811,15 @@ function buildClientScript(): string {
     }
     showBanner("", "");
     state.loading = true;
-    var q = new URLSearchParams();
-    q.set("timeFrom", tr.timeFrom);
-    q.set("timeTo", tr.timeTo);
-    q.set("agentId", aid);
     var sid = state.selectedSessionId.trim();
-    if (sid) {
-      q.set("sessionId", sid);
-    }
     try {
-      var r = await fetchMemoryApi("/dashboard?" + q.toString());
+      var dashParams = {
+        timeFrom: tr.timeFrom,
+        timeTo: tr.timeTo,
+        agentId: aid
+      };
+      if (sid) dashParams.sessionId = sid;
+      var r = await fetchMemoryApi("memory.admin.dashboard", dashParams);
       var data = await r.json().catch(function () {
         return {};
       });
@@ -1474,11 +1838,17 @@ function buildClientScript(): string {
   async function loadFacets(opts) {
     var autoLoad = !opts || opts.autoLoad !== false;
     showBanner("", "");
-    var r = await fetchMemoryApi(facetQueryPath());
+    var r = await fetchMemoryApi("memory.admin.facets", { tab: state.tab });
     if (!r.ok) {
       var err = await r.text();
       var hint401 = r.status === 401 ? " 需要 Token：URL ?token= 或 #/path?token=（与 gateway.auth.token 一致）" : "";
-      showBanner("err", "加载下拉失败: " + r.status + " " + err + hint401);
+      var hint403 =
+        r.status === 403 && String(err).toLowerCase().indexOf("scope") >= 0
+          ? isMemoryPanelLoopbackHost()
+            ? " 请在 openclaw.json 设置 gateway.controlUi.allowInsecureAuth: true 后重启 gateway。"
+            : " 请在 openclaw.json 设置 gateway.controlUi.dangerouslyDisableDeviceAuth: true（或改用 127.0.0.1 打开）后重启 gateway。"
+          : "";
+      showBanner("err", "加载下拉失败: " + r.status + " " + err + hint401 + hint403);
       return;
     }
     var data = await r.json().catch(function () {
@@ -1547,8 +1917,13 @@ function buildClientScript(): string {
     state.loading = true;
     state.page = page || 1;
     try {
-      var lq = listQueryPath(state.page, tr);
-      var r = await fetchMemoryApi(lq.path);
+      var lq = listQueryParams(state.page, tr);
+      if (lq.error) {
+        showBanner("err", lq.error);
+        document.getElementById("pager").style.display = "none";
+        return;
+      }
+      var r = await fetchMemoryApi("memory.admin.list", lq.params);
       var data = await r.json().catch(function () { return {}; });
       if (!r.ok) {
         showBanner("err", (data && data.error) ? String(data.error) : "列表请求失败 " + r.status);
@@ -1891,12 +2266,7 @@ function buildClientScript(): string {
     });
     if (!sel.length) return;
     if (!window.confirm("确认永久删除所选 " + sel.length + " 条？此操作不可恢复。")) return;
-    var body = JSON.stringify({ items: sel });
-    var r = await fetchMemoryApi("/delete", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: body
-    });
+    var r = await fetchMemoryApi("memory.admin.delete", { items: sel });
     var data = await r.json().catch(function () { return {}; });
     if (!r.ok) {
       showBanner("err", (data && data.error) ? String(data.error) : "删除失败 " + r.status);
@@ -1928,11 +2298,7 @@ function buildClientScript(): string {
       return;
     }
     showBanner("", "");
-    var r = await fetchMemoryApi("/add", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ agentId: agentId, category: category, text: text })
-    });
+    var r = await fetchMemoryApi("memory.admin.add", { agentId: agentId, category: category, text: text });
     var data = await r.json().catch(function () { return {}; });
     if (!r.ok) {
       showBanner("err", (data && data.error) ? String(data.error) : "添加失败 " + r.status);
