@@ -318,6 +318,23 @@ export class MemoryDB {
     await this.ensureInitialized();
   }
 
+  /**
+   * Checkout the latest dataset version before every read operation.
+   * LanceDB's Table object may remain pinned to a stale snapshot after createIndex() or after
+   * any write when the JS-side dataset reference is not automatically advanced. Calling
+   * checkoutLatest() is the official API to advance the read version to HEAD without
+   * reopening the connection. Called internally before all query paths.
+   */
+  private async refreshToLatest(): Promise<void> {
+    if (this.table) {
+      try {
+        await this.table.checkoutLatest();
+      } catch {
+        // checkoutLatest is best-effort; ignore errors (e.g. table already at latest)
+      }
+    }
+  }
+
   private async doInitialize(): Promise<void> {
     const lancedb = await loadLanceDB();
     this.db = await lancedb.connect(this.dbPath);
@@ -342,15 +359,22 @@ export class MemoryDB {
         contentHash: "",
         chunkIndex: 0,
       };
-      this.table = await this.db.createTable(LANCEDB_TABLE_NAME, [seed]);
-      await this.table.delete('id = "__schema__"');
-      await createScalarIndexesWithBootstrap(this.table, this.vectorDim);
+      const newTable = await this.db.createTable(LANCEDB_TABLE_NAME, [seed]);
+      await newTable.delete('id = "__schema__"');
+      await createScalarIndexesWithBootstrap(newTable, this.vectorDim);
+      // Re-open the table after createScalarIndexesWithBootstrap to refresh the internal
+      // Lance dataset snapshot reference. createIndex() may leave the Table object pointing
+      // at a stale dataset version, causing subsequent query() calls to return empty results
+      // even after storeMany() writes data successfully. openTable() always resolves to the
+      // latest manifest on disk, restoring snapshot consistency.
+      this.table = await this.db.openTable(LANCEDB_TABLE_NAME);
     }
   }
 
   /** Count rows matching admin UI filters (same predicate as list). */
   async countAdminFiltered(f: AdminListFilters): Promise<number> {
     await this.ensureInitialized();
+    await this.refreshToLatest();
     const where = buildAdminWhereClause(f);
     return this.table!.countRows(where);
   }
@@ -379,6 +403,7 @@ export class MemoryDB {
       filters.sessionId = sid;
     }
     await this.ensureInitialized();
+    await this.refreshToLatest();
     const where = buildAdminWhereClause(filters);
     const total = await this.table!.countRows(where);
     if (total > ADMIN_LIST_MAX_MATCHING) {
@@ -540,6 +565,7 @@ export class MemoryDB {
     options?: { adminTab?: "user" | "self" | "full"; sortDesc?: boolean },
   ): Promise<{ total: number; items: MemoryEntry[] }> {
     await this.ensureInitialized();
+    await this.refreshToLatest();
     const where = buildAdminWhereClause(f);
     const total = await this.table!.countRows(where);
     if (total > ADMIN_LIST_MAX_MATCHING) {
@@ -598,6 +624,7 @@ export class MemoryDB {
       return [];
     }
     await this.ensureInitialized();
+    await this.refreshToLatest();
     const a = sqlEscapeLiteral(agentId);
     const list = categories.map((c) => `'${sqlEscapeLiteral(String(c))}'`).join(", ");
     const where = `id != '${sqlEscapeLiteral(BOOTSTRAP_ROW_ID)}' AND agentId = '${a}' AND isDeleted = 0 AND category IN (${list})`;
@@ -619,16 +646,23 @@ export class MemoryDB {
       timeToMs,
     };
     await this.ensureInitialized();
+    await this.refreshToLatest();
     const where = buildAdminWhereClause(f);
-    const rows = await this.table!
-      .query()
-      .where(where)
-      .select(["agentId", "sessionId"])
-      .limit(25_000)
-      .toArray();
+    let rows: Array<Record<string, unknown>>;
+    try {
+      rows = (await this.table!
+        .query()
+        .where(where)
+        .select(["agentId", "sessionId"])
+        .limit(25_000)
+        .toArray()) as Array<Record<string, unknown>>;
+    } catch (e) {
+      console.warn("[openclaw-memory-alibaba-local] listAdminFacets query failed:", String(e));
+      return { agents: [], sessions: [] };
+    }
     const agents = new Set<string>();
     const sessions = new Set<string>();
-    for (const row of rows as Array<Record<string, unknown>>) {
+    for (const row of rows) {
       const a = String(row.agentId ?? "").trim();
       const s = String(row.sessionId ?? "").trim();
       if (a) {
@@ -744,6 +778,7 @@ export class MemoryDB {
       return false;
     }
     await this.ensureInitialized();
+    await this.refreshToLatest();
     const a = sqlEscapeLiteral(agentId);
     const s = sqlEscapeLiteral(normSessionId(sessionId));
     const c = sqlEscapeLiteral(String(category));
@@ -789,6 +824,7 @@ export class MemoryDB {
     categories?: MemoryCategory[],
   ): Promise<MemorySearchResult[]> {
     await this.ensureInitialized();
+    await this.refreshToLatest();
     const a = sqlEscapeLiteral(agentId);
     const parts = [`agentId = '${a}'`, `isDeleted = 0`];
     if (Array.isArray(categories) && categories.length > 0) {

@@ -916,21 +916,10 @@ function buildClientScript(): string {
     }
   }
 
-  function gatewayWsUrl() {
-    return (location.protocol === "https:" ? "wss:" : "ws:") + "//" + location.host;
-  }
-
   /** 与网关 isLocalClient 一致：仅这些主机用 Control UI 客户端 + allowInsecureAuth 即可；其它主机需 probe + dangerouslyDisableDeviceAuth 等 */
   function isMemoryPanelLoopbackHost() {
     var h = (location.hostname || "").toLowerCase();
     return h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "[::1]";
-  }
-
-  function gatewayPanelConnectClient() {
-    if (isMemoryPanelLoopbackHost()) {
-      return { id: "openclaw-control-ui", mode: "ui" };
-    }
-    return { id: "openclaw-probe", mode: "probe" };
   }
 
   function hintGatewayControlUiInsecureAuth() {
@@ -947,163 +936,9 @@ function buildClientScript(): string {
     );
   }
 
-  var gwState = {
-    ws: null,
-    pending: new Map(),
-    phase: "off",
-    connectPromise: null,
-    reqSeq: 0,
-    connectResolve: null,
-    connectReject: null
-  };
-
-  function gwNextId() {
-    gwState.reqSeq += 1;
-    return "m" + gwState.reqSeq + "-" + Date.now();
-  }
-
-  function gwFailAllPending(err) {
-    gwState.pending.forEach(function (fn) {
-      try {
-        fn({ ok: false, error: { message: String(err && err.message ? err.message : err) } });
-      } catch (e) {}
-    });
-    gwState.pending.clear();
-  }
-
-  function gwOnMessage(ev) {
-    var msg;
-    try {
-      msg = JSON.parse(ev.data);
-    } catch (e) {
-      return;
-    }
-    if (gwState.phase === "wait-challenge") {
-      if (msg.type === "event" && msg.event === "connect.challenge") {
-        gwState.phase = "wait-connect-res";
-        var cid = gwNextId();
-        var tok = getGatewayToken();
-        gwState.pending.set(cid, function (resMsg) {
-          if (!resMsg.ok) {
-            gwState.phase = "failed";
-            var em = (resMsg.error && resMsg.error.message) ? String(resMsg.error.message) : "connect failed";
-            if (gwState.connectReject) gwState.connectReject(new Error(em));
-            return;
-          }
-          gwState.phase = "ready";
-          if (gwState.connectResolve) gwState.connectResolve();
-        });
-        var gwc = gatewayPanelConnectClient();
-        gwState.ws.send(
-          JSON.stringify({
-            type: "req",
-            id: cid,
-            method: "connect",
-            params: {
-              minProtocol: 3,
-              maxProtocol: 3,
-              client: {
-                id: gwc.id,
-                version: "memory-panel",
-                platform: typeof navigator !== "undefined" && navigator.platform ? navigator.platform : "web",
-                mode: gwc.mode
-              },
-              role: "operator",
-              scopes: ["operator.admin"],
-              auth: tok ? { token: tok } : {}
-            }
-          })
-        );
-      }
-      return;
-    }
-    if (msg.type === "res" && gwState.pending.has(msg.id)) {
-      var fn = gwState.pending.get(msg.id);
-      gwState.pending.delete(msg.id);
-      fn(msg);
-    }
-  }
-
-  function ensureGatewayConnected() {
-    if (gwState.phase === "ready" && gwState.ws && gwState.ws.readyState === 1) {
-      return Promise.resolve();
-    }
-    if (gwState.connectPromise) {
-      return gwState.connectPromise;
-    }
-    if (gwState.ws) {
-      try {
-        gwState.ws.close();
-      } catch (e) {}
-      gwState.ws = null;
-    }
-    gwState.phase = "wait-challenge";
-    gwState.pending.clear();
-    gwState.connectPromise = new Promise(function (resolve, reject) {
-      gwState.connectResolve = resolve;
-      gwState.connectReject = reject;
-      try {
-        gwState.ws = new WebSocket(gatewayWsUrl());
-      } catch (e) {
-        gwState.phase = "failed";
-        gwState.connectPromise = null;
-        reject(e);
-        return;
-      }
-      gwState.ws.onmessage = gwOnMessage;
-      gwState.ws.onerror = function () {
-        if (gwState.phase !== "ready") {
-          gwState.phase = "failed";
-          gwState.connectPromise = null;
-          if (gwState.connectReject) gwState.connectReject(new Error("WebSocket error"));
-        }
-      };
-      gwState.ws.onclose = function () {
-        var wasReady = gwState.phase === "ready";
-        gwState.phase = "off";
-        gwState.ws = null;
-        gwState.connectPromise = null;
-        if (wasReady) {
-          gwFailAllPending(new Error("WebSocket closed"));
-        }
-      };
-    });
-    return gwState.connectPromise.finally(function () {
-      gwState.connectPromise = null;
-      gwState.connectResolve = null;
-      gwState.connectReject = null;
-    });
-  }
-
-  function gatewayRpc(method, params) {
-    return ensureGatewayConnected().then(function () {
-      return new Promise(function (resolve, reject) {
-        if (!gwState.ws || gwState.ws.readyState !== 1) {
-          reject(new Error("WebSocket not open"));
-          return;
-        }
-        var id = gwNextId();
-        gwState.pending.set(id, function (msg) {
-          if (msg.ok) {
-            resolve({ ok: true, data: msg.payload });
-          } else {
-            var em = msg.error && msg.error.message ? String(msg.error.message) : "rpc error";
-            var low = em.toLowerCase();
-            var unauth =
-              low.indexOf("unauthorized") >= 0 ||
-              low.indexOf("token mismatch") >= 0 ||
-              low.indexOf("token missing") >= 0 ||
-              low.indexOf("missing scope") >= 0;
-            resolve({ ok: false, unauthorized: unauth, message: em, payload: msg.payload });
-          }
-        });
-        gwState.ws.send(JSON.stringify({ type: "req", id: id, method: method, params: params || {} }));
-      });
-    });
-  }
-
   /**
-   * 非本机 hostname（公网 IP / 域名）时 Gateway WebSocket 会剥离 operator.admin；同源 HTTP 仅需 gateway token（与观测插件一致）。
+   * 同源 POST：仅需 gateway token（Authorization Bearer 或 URL ?token=），不经 WebSocket operator scope。
+   * 本机 localhost 也走此路径，避免 WS 上 memory.admin.* 因 scope/载荷格式问题被映射成模糊的 config 502。
    */
   async function fetchMemoryApiHttp(method, params) {
     var tok = getGatewayToken();
@@ -1111,9 +946,13 @@ function buildClientScript(): string {
     if (tok) {
       headers["Authorization"] = "Bearer " + tok;
     }
+    var callUrl = "/plugins/memory/api/v1/call";
+    if (tok) {
+      callUrl += "?token=" + encodeURIComponent(tok);
+    }
     var resp;
     try {
-      resp = await fetch("/plugins/memory/api/v1/call", {
+      resp = await fetch(callUrl, {
         method: "POST",
         headers: headers,
         body: JSON.stringify({ method: method, params: params || {} })
@@ -1164,58 +1003,10 @@ function buildClientScript(): string {
     };
   }
 
-  /** 与原先 fetch 类似的接口：ok / status / json() / text() */
+  /** 与原先 fetch 类似的接口：ok / status / json() / text()（一律走同源 HTTP，与 token 行为一致） */
   async function fetchMemoryApi(method, params) {
     var p = params || {};
-    if (!isMemoryPanelLoopbackHost()) {
-      return fetchMemoryApiHttp(method, p);
-    }
-    try {
-      var res = await gatewayRpc(method, p);
-      if (res.ok) {
-        return {
-          ok: true,
-          status: 200,
-          json: function () {
-            return Promise.resolve(res.data);
-          },
-          text: function () {
-            return Promise.resolve("");
-          }
-        };
-      }
-      if (res.unauthorized) {
-        var httpRes = await fetchMemoryApiHttp(method, p);
-        if (httpRes.ok) {
-          return httpRes;
-        }
-      }
-      var st = res.payload && res.payload.status ? parseInt(String(res.payload.status), 10) : 0;
-      if (!Number.isFinite(st) || st < 400) {
-        st = res.unauthorized ? 403 : 502;
-      }
-      return {
-        ok: false,
-        status: st,
-        json: function () {
-          return Promise.resolve(res.payload && (res.payload.error || res.payload) ? res.payload : { error: res.message });
-        },
-        text: function () {
-          return Promise.resolve(res.message || "");
-        }
-      };
-    } catch (e) {
-      return {
-        ok: false,
-        status: 0,
-        json: function () {
-          return Promise.resolve({ error: String(e) });
-        },
-        text: function () {
-          return Promise.resolve(String(e));
-        }
-      };
-    }
+    return fetchMemoryApiHttp(method, p);
   }
 
   function showBanner(kind, msg) {
@@ -1448,7 +1239,7 @@ function buildClientScript(): string {
             : "";
         throw new Error(
           (r.status === 401
-            ? "未授权：请在 URL 使用 ?token=（与 ~/.openclaw/openclaw.json 中 gateway.auth.token 一致），hash 路由可用 #/path?token=；面板通过 WebSocket 连接网关时会在 connect 中携带该 token。成功一次后会写入本机 localStorage。"
+            ? "未授权：请在 URL 使用 ?token=（与 ~/.openclaw/openclaw.json 中 gateway.auth.token 一致），hash 路由可用 #/path?token=；请求 /plugins/memory/api/v1/call 时会携带该 token（Bearer 与 query）。成功一次后会写入本机 localStorage。"
             : "拒绝访问：" + (detailAuth.error ? String(detailAuth.error) : (await r.text().catch(function () { return ""; }))) + hintScope)
         );
       }
@@ -1462,8 +1253,8 @@ function buildClientScript(): string {
           low0.indexOf("device identity") >= 0 || low0.indexOf("control ui") >= 0 ? hintGatewayControlUiInsecureAuth() : "";
         throw new Error(
           msg0
-            ? "无法连接网关 WebSocket 或握手失败：" + msg0 + hintHandshake
-            : "无法连接网关 WebSocket（请确认网关已启动、页面与网关同源，且 token 正确）。仍失败请查看 gateway 日志。"
+            ? "无法请求记忆 API（网络或网关错误）：" + msg0 + hintHandshake
+            : "无法请求记忆 API（请确认网关已启动、页面与网关同源，且 token 正确）。仍失败请查看 gateway 日志。"
         );
       }
       throw new Error("config " + r.status);

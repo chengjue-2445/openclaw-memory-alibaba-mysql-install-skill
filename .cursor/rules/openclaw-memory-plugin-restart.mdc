@@ -1,0 +1,10 @@
+---
+description: After editing the OpenClaw memory plugin, restart gateway for changes to load
+alwaysApply: true
+---
+
+# 记忆插件与 Gateway
+
+修改 `openclaw-memory-alibaba-local/` 下任意源码或配置后，**必须执行** `openclaw gateway restart`，网关才会加载新版本插件（不会热重载插件 JS）。
+
+在相关改动的收尾步骤中应主动执行重启，而不是只提醒用户自行重启。

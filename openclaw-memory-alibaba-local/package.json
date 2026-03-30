@@ -1,8 +1,11 @@
 {
   "name": "openclaw-memory-alibaba-local",
-  "version": "0.1.6",
+  "version": "0.1.8-beta.2",
   "description": "OpenClaw memory plugin: local LanceDB + DashScope-compatible embeddings",
   "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -25,6 +28,7 @@
   "dependencies": {
     "@lancedb/lancedb": "^0.27.1",
     "@sinclair/typebox": "0.34.48",
+    "node-llama-cpp": "^3.16.2",
     "openai": "^6.25.0"
   },
   "peerDependencies": {

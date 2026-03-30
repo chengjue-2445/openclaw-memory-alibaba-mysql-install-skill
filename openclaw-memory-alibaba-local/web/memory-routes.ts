@@ -8,8 +8,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { GatewayRequestHandlerOptions, OpenClawPluginApi } from "openclaw/plugin-sdk/core";
-import type { MemoryConfig } from "../config.js";
-import type { MemoryDB } from "../db.js";
 import { getMemoryPanelHtml } from "./memory-ui.js";
 import {
   opMemoryAdminAdd,
@@ -24,6 +22,9 @@ import {
 } from "./memory-admin-ops.js";
 
 export type MemoryPanelRoutesOpts = MemoryAdminOpsOpts;
+
+/** 异步初始化完成后再解析出 admin 用的 db/cfg（避免 WS 在 embedding 编译完成前报 unknown method）。 */
+export type AdminOpsContextProvider = () => Promise<MemoryAdminOpsContext>;
 
 export type RegisterHttpRoute = (params: {
   path: string;
@@ -99,20 +100,13 @@ function applyAdminOpResult(respond: GatewayRequestHandlerOptions["respond"], re
 /** Gateway WebSocket methods: memory.admin.config | facets | dashboard | list | delete | add */
 export function registerMemoryAdminGatewayMethods(
   registerGatewayMethod: RegisterGatewayMethod,
-  db: MemoryDB,
-  cfg: MemoryConfig,
+  getCtx: AdminOpsContextProvider,
   logger: PluginLogger,
-  opts?: MemoryPanelRoutesOpts | null,
 ): void {
-  const ctxBase: MemoryAdminOpsContext = {
-    db,
-    cfg,
-    opts: opts ?? undefined,
-  };
-
   registerGatewayMethod("memory.admin.config", async ({ params, respond }) => {
     void params;
     try {
+      const ctxBase = await getCtx();
       applyAdminOpResult(respond, await opMemoryAdminConfig(ctxBase));
     } catch (e) {
       logger.warn(`memory.admin.config: ${String(e)}`);
@@ -123,6 +117,7 @@ export function registerMemoryAdminGatewayMethods(
   registerGatewayMethod("memory.admin.facets", async ({ params, respond }) => {
     void params;
     try {
+      const ctxBase = await getCtx();
       applyAdminOpResult(respond, await opMemoryAdminFacets(ctxBase));
     } catch (e) {
       logger.warn(`memory.admin.facets: ${String(e)}`);
@@ -132,6 +127,7 @@ export function registerMemoryAdminGatewayMethods(
 
   registerGatewayMethod("memory.admin.dashboard", async ({ params, respond }) => {
     try {
+      const ctxBase = await getCtx();
       applyAdminOpResult(respond, await opMemoryAdminDashboard(ctxBase, params ?? {}));
     } catch (e) {
       logger.warn(`memory.admin.dashboard: ${String(e)}`);
@@ -141,6 +137,7 @@ export function registerMemoryAdminGatewayMethods(
 
   registerGatewayMethod("memory.admin.list", async ({ params, respond }) => {
     try {
+      const ctxBase = await getCtx();
       applyAdminOpResult(respond, await opMemoryAdminList(ctxBase, params ?? {}));
     } catch (e) {
       logger.warn(`memory.admin.list: ${String(e)}`);
@@ -150,6 +147,7 @@ export function registerMemoryAdminGatewayMethods(
 
   registerGatewayMethod("memory.admin.delete", async ({ params, respond }) => {
     try {
+      const ctxBase = await getCtx();
       applyAdminOpResult(respond, await opMemoryAdminDelete(ctxBase, params ?? {}));
     } catch (e) {
       logger.warn(`memory.admin.delete: ${String(e)}`);
@@ -159,6 +157,7 @@ export function registerMemoryAdminGatewayMethods(
 
   registerGatewayMethod("memory.admin.add", async ({ params, respond }) => {
     try {
+      const ctxBase = await getCtx();
       applyAdminOpResult(respond, await opMemoryAdminAdd(ctxBase, params ?? {}));
     } catch (e) {
       logger.warn(`memory.admin.add: ${String(e)}`);
@@ -215,16 +214,9 @@ async function dispatchMemoryAdminRpc(
  */
 export function registerMemoryPanelRoutes(
   registerHttpRoute: RegisterHttpRoute,
-  db: MemoryDB,
-  cfg: MemoryConfig,
+  getCtx: AdminOpsContextProvider,
   logger: PluginLogger,
-  opts?: MemoryPanelRoutesOpts | null,
 ): void {
-  const ctxBase: MemoryAdminOpsContext = {
-    db,
-    cfg,
-    opts: opts ?? undefined,
-  };
   const requiredToken = resolveGatewayToken();
   const token = typeof requiredToken === "string" && requiredToken.length > 0 ? requiredToken : undefined;
 
@@ -270,6 +262,7 @@ export function registerMemoryPanelRoutes(
               return true;
             }
             try {
+              const ctxBase = await getCtx();
               const result = await dispatchMemoryAdminRpc(ctxBase, method, body.params ?? {});
               if (result.ok) {
                 sendJson(res, 200, result.data as unknown);

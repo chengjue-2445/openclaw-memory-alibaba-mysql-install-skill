@@ -36,8 +36,8 @@ import {
 } from "./categories.js";
 import {
   DEFAULT_CAPTURE_MAX_CHARS,
-  memoryConfigSchema,
   embeddingVectorDim,
+  memoryConfigSchema,
   type MemoryConfig,
   type LLMConfig,
 } from "./config.js";
@@ -53,6 +53,7 @@ import {
   saveAgentEndCursorMap,
 } from "./capture-state.js";
 import { LANCEDB_TABLE_NAME, MemoryDB } from "./db.js";
+import type { MemoryAdminOpsContext } from "./web/memory-admin-ops.js";
 import { registerMemoryAdminGatewayMethods, registerMemoryPanelRoutes } from "./web/memory-routes.js";
 import type { MemoryEntry, MemorySearchResult } from "./db.js";
 import {
@@ -174,6 +175,27 @@ function getThresholdForCategory(cfg: MemoryConfig, category: MemoryCategory): n
   return cfg.similarityThresholdSelfImproving;
 }
 
+/** 可选：给 LLM / 衰减诊断日志（与 OpenClaw api.logger 兼容，仅用 info）。 */
+type MemoryDiagnosticLog = { info: (m: string) => void } | undefined;
+
+const LLM_PROMPT_LOG_MAX_CHARS = 24_000;
+
+/** 记录发往 chat.completions 的单条 user 全文（超长截断）。 */
+function logChatCompletionsUserContent(tag: string, userContent: string, log: MemoryDiagnosticLog): void {
+  if (!log) return;
+  const n = userContent.length;
+  const body =
+    n <= LLM_PROMPT_LOG_MAX_CHARS
+      ? userContent
+      : `${userContent.slice(0, LLM_PROMPT_LOG_MAX_CHARS)}\n…(truncated, totalChars=${n})`;
+  log.info(`openclaw-memory-alibaba-local: llm ${tag} chat.completions messages[0].role=user content (${n} chars):\n${body}`);
+}
+
+/** 记忆衰减为纯公式，不向模型发提示词；仍打日志避免与「冲突检测 LLM」混淆。 */
+function logMemoryDecayNoLlm(phase: string, log: MemoryDiagnosticLog, detail: string): void {
+  log?.info(`openclaw-memory-alibaba-local: memoryDecay ${phase} (no LLM; formula-only) ${detail}`);
+}
+
 /** Apply time decay to recall results: effectiveScore = score * decay(createdAt). Returns new array sorted by effectiveScore desc. */
 function applyMemoryDecay(
   results: MemorySearchResult[],
@@ -208,6 +230,7 @@ async function runRecall(
   agentId: string,
   queryVectors: number[][],
   options: { limitUser: number; limitSelf: number; minScore: number },
+  log?: MemoryDiagnosticLog,
 ): Promise<MemorySearchResult[]> {
   if (queryVectors.length === 0) {
     return [];
@@ -235,11 +258,17 @@ async function runRecall(
 
   let results = [...resultsUser, ...resultsSelf];
   if (cfg.enableMemoryDecay && results.length > 0) {
+    const decayIn = results.length;
     results = applyMemoryDecay(
       results,
       Date.now(),
       cfg.memoryDecayStrategy,
       cfg.memoryDecayHalfLifeDays,
+    );
+    logMemoryDecayNoLlm(
+      "vectorRecall",
+      log,
+      `strategy=${cfg.memoryDecayStrategy} halfLifeDays=${cfg.memoryDecayHalfLifeDays} agentId=${agentId} inputRows=${decayIn}`,
     );
   }
   results = results
@@ -255,6 +284,7 @@ async function bm25SupplementRecall(
   queryText: string,
   vectorResults: MemorySearchResult[],
   maxAdd: number,
+  log?: MemoryDiagnosticLog,
 ): Promise<MemorySearchResult[]> {
   const q = queryText.trim();
   if (q.length < 2 || maxAdd <= 0) {
@@ -300,7 +330,13 @@ async function bm25SupplementRecall(
   }
   let ranked = pool;
   if (cfg.enableMemoryDecay) {
+    const decayIn = ranked.length;
     ranked = applyMemoryDecay(ranked, Date.now(), cfg.memoryDecayStrategy, cfg.memoryDecayHalfLifeDays);
+    logMemoryDecayNoLlm(
+      "bm25Pool",
+      log,
+      `strategy=${cfg.memoryDecayStrategy} halfLifeDays=${cfg.memoryDecayHalfLifeDays} agentId=${agentId} inputRows=${decayIn}`,
+    );
   }
   ranked.sort((a, b) => {
     const ia = a.entry.importance ?? 0;
@@ -331,11 +367,12 @@ async function runHybridRecall(
   queryText: string,
   queryVectors: number[][],
   options: { limitUser: number; limitSelf: number; minScore: number },
+  log?: MemoryDiagnosticLog,
 ): Promise<MemorySearchResult[]> {
-  const vector = await runRecall(db, cfg, agentId, queryVectors, options);
+  const vector = await runRecall(db, cfg, agentId, queryVectors, options, log);
   const extra =
     queryText.trim().length >= 2
-      ? await bm25SupplementRecall(db, cfg, agentId, queryText, vector, RECALL_BM25_MAX)
+      ? await bm25SupplementRecall(db, cfg, agentId, queryText, vector, RECALL_BM25_MAX, log)
       : [];
   return [...vector, ...extra].slice(0, RECALL_FINAL_MAX);
 }
@@ -364,6 +401,7 @@ async function extractUserMemoriesWithLLM(
   llmConfig: LLMConfig,
   userMessages: string[],
   maxExtractions = 5,
+  log?: MemoryDiagnosticLog,
 ): Promise<LLMExtractionItem[]> {
   if (userMessages.length === 0) return [];
   const combined = userMessages
@@ -371,6 +409,7 @@ async function extractUserMemoriesWithLLM(
     .map((t, i) => `[${i + 1}] ${t}`)
     .join("\n\n");
   const prompt = buildUserMemoryExtractionPrompt() + combined;
+  logChatCompletionsUserContent("userMemoryExtraction", prompt, log);
   const openai = new OpenAI({
     apiKey: llmConfig.apiKey,
     baseURL: llmConfig.baseUrl,
@@ -449,9 +488,11 @@ async function extractSelfImprovingWithLLM(
   llmConfig: LLMConfig,
   conversationText: string,
   maxExtractions = MAX_AUTO_CAPTURE_SELF_IMPROVING,
+  log?: MemoryDiagnosticLog,
 ): Promise<SelfImprovingExtractionItem[]> {
   if (conversationText.length < 20) return [];
   const prompt = SELF_IMPROVING_EXTRACTION_INSTRUCTIONS + "\n" + conversationText;
+  logChatCompletionsUserContent("selfImprovingExtraction", prompt, log);
   const openai = new OpenAI({
     apiKey: llmConfig.apiKey,
     baseURL: llmConfig.baseUrl,
@@ -496,6 +537,7 @@ async function decideInsertOrUpdate(
   llmConfig: LLMConfig,
   newText: string,
   candidates: MemorySearchResult[],
+  log?: MemoryDiagnosticLog,
 ): Promise<DedupLLMResponse> {
   const openai = new OpenAI({
     apiKey: llmConfig.apiKey,
@@ -524,6 +566,8 @@ Reply with ONLY a single JSON object, no other text. Valid forms:
 {"action":"update","memoryId":"<uuid>"}
 Use the exact "id" value from the list above for memoryId.`;
 
+  logChatCompletionsUserContent("conflictDedupSingle", prompt, log);
+
   const completion = await openai.chat.completions.create({
     model: llmConfig.model,
     messages: [{ role: "user", content: prompt }],
@@ -549,10 +593,11 @@ type BatchDedupDecision = { action: "insert" } | { action: "update"; memoryId: s
 async function decideBatchInsertOrUpdate(
   llmConfig: LLMConfig,
   cases: Array<{ newText: string; candidates: MemorySearchResult[] }>,
+  log?: MemoryDiagnosticLog,
 ): Promise<BatchDedupDecision[]> {
   if (cases.length === 0) return [];
   if (cases.length === 1) {
-    const d = await decideInsertOrUpdate(llmConfig, cases[0].newText, cases[0].candidates);
+    const d = await decideInsertOrUpdate(llmConfig, cases[0].newText, cases[0].candidates, log);
     if (d.action === "insert") return [{ action: "insert" }];
     return [{ action: "update", memoryId: d.memoryId }];
   }
@@ -581,6 +626,8 @@ Reply with ONLY a JSON object of this exact shape:
 {"decisions":[{"action":"insert"},{"action":"update","memoryId":"<uuid>"},...]}
 The "decisions" array MUST have exactly ${cases.length} elements, in order: decisions[k] is for Case k.
 For "update", memoryId must be copied exactly from that case's existing id list.`;
+
+  logChatCompletionsUserContent(`conflictDedupBatch cases=${cases.length}`, prompt, log);
 
   const openai = new OpenAI({
     apiKey: llmConfig.apiKey,
@@ -879,8 +926,8 @@ async function runAgentEndCapture(
   }
 
   await Promise.all([
-    captureUserMemoryFromInboundTexts(cfg, db, backend, agentId, sid, userId, userRawTexts),
-    captureSelfImprovingFromLines(cfg, db, backend, agentId, sid, userId, uaLines),
+    captureUserMemoryFromInboundTexts(cfg, db, backend, agentId, sid, userId, userRawTexts, log),
+    captureSelfImprovingFromLines(cfg, db, backend, agentId, sid, userId, uaLines, log),
   ]);
 
   map[key] = {
@@ -900,6 +947,7 @@ async function captureUserMemoryFromInboundTexts(
   sessionKey: string,
   userId: string | null,
   inboundTexts: string[],
+  log: { info: (m: string) => void },
 ): Promise<void> {
   if (inboundTexts.length === 0) {
     return;
@@ -915,9 +963,12 @@ async function captureUserMemoryFromInboundTexts(
   if (cfg.memoryExtractionMethod === "llm" && cfg.llm) {
     const toSend = texts.filter((t) => t.length >= 10 && t.length <= cfg.captureMaxChars);
     if (toSend.length > 0) {
-      const extractions = await extractUserMemoriesWithLLM(cfg.llm, toSend, MAX_AUTO_CAPTURE_LLM).catch(
-        () => [] as LLMExtractionItem[],
-      );
+      const extractions = await extractUserMemoriesWithLLM(
+        cfg.llm,
+        toSend,
+        MAX_AUTO_CAPTURE_LLM,
+        log,
+      ).catch(() => [] as LLMExtractionItem[]);
       for (const e of extractions) {
         candidates.push({ category: e.category, text: e.text, importance: e.importance });
       }
@@ -938,6 +989,7 @@ async function captureUserMemoryFromInboundTexts(
     await storeOneCaptureItem(agentId, { ...item, text }, cfg, db, backend, {
       userId,
       sessionId: sessionKey,
+      log,
     });
   }
 }
@@ -951,6 +1003,7 @@ async function captureSelfImprovingFromLines(
   sessionKey: string,
   userId: string | null,
   lines: string[],
+  log: { info: (m: string) => void },
 ): Promise<void> {
   if (!cfg.enableSelfImprovingMemory || lines.length === 0) {
     return;
@@ -969,6 +1022,7 @@ async function captureSelfImprovingFromLines(
       cfg.llm,
       combined,
       MAX_AUTO_CAPTURE_SELF_IMPROVING,
+      log,
     ).catch(() => [] as SelfImprovingExtractionItem[]);
     for (const e of extractions) {
       candidates.push({
@@ -995,6 +1049,7 @@ async function captureSelfImprovingFromLines(
     await storeOneCaptureItem(agentId, item, cfg, db, backend, {
       userId,
       sessionId: sessionKey,
+      log,
     });
   }
 }
@@ -1073,6 +1128,7 @@ async function storeOneCaptureItem(
     sessionId?: string | null;
     batchId?: string | null;
     seqInBatch?: number | null;
+    log?: { info: (m: string) => void };
   },
 ): Promise<StoreOneResult> {
   if (isFullContextStoredWithoutEmbedding(item.category)) {
@@ -1117,7 +1173,7 @@ async function storeOneCaptureItem(
     return { action: "created", entry: stored[0]! };
   }
 
-  const decision = await decideInsertOrUpdate(cfg.llm!, item.text, candidates);
+  const decision = await decideInsertOrUpdate(cfg.llm!, item.text, candidates, options?.log);
   if (decision.action === "update") {
     const hit =
       candidates.find((c) => c.entry.id === decision.memoryId) ?? candidates[0]!;
@@ -1143,13 +1199,16 @@ async function storeNonFullContextItemsBatch(
   cfg: MemoryConfig,
   db: MemoryDB,
   backend: EmbeddingBackend,
-  options?: { userId?: string | null; sessionId?: string | null },
+  options?: { userId?: string | null; sessionId?: string | null; log?: { info: (m: string) => void } },
 ): Promise<void> {
   if (items.length === 0) return;
 
   if (!cfg.memory_duplication_conflict_process) {
     for (const item of items) {
-      await storeOneCaptureItem(agentId, item, cfg, db, backend, options);
+      await storeOneCaptureItem(agentId, item, cfg, db, backend, {
+        ...options,
+        log: options?.log,
+      });
     }
     return;
   }
@@ -1190,6 +1249,7 @@ async function storeNonFullContextItemsBatch(
   const decisions = await decideBatchInsertOrUpdate(
     cfg.llm!,
     needJudge.map((p) => ({ newText: p.item.text, candidates: p.similar })),
+    options?.log,
   );
 
   for (let i = 0; i < needJudge.length; i++) {
@@ -1216,55 +1276,102 @@ const memoryPlugin = {
   name: "openclaw-memory-alibaba-local",
   description:
     "Local LanceDB long-term memory (DashScope-friendly); user_memory_fact / user_memory_preference / user_memory_decision",
-  kind: "memory" as const,
+  /** Custom kind: not OpenClaw `PluginKind` union; avoids `plugins.slots.memory` auto-switch on install. */
+  kind: "rds_memory" as "memory",
   configSchema: memoryConfigSchema,
 
   register(api: OpenClawPluginApi) {
     const cfg = memoryConfigSchema.parse(api.pluginConfig);
-    let backend: EmbeddingBackend | null = null;
     const resolvedDbPath = api.resolvePath(cfg.dbPath!);
-    const vectorDim = cfg.embedding ? embeddingVectorDim(cfg.embedding) : 768;
-    const db = new MemoryDB(resolvedDbPath, vectorDim);
-    if (cfg.embedding) {
-      backend = createEmbeddingBackend(cfg.embedding);
-      const mode = cfg.embedding.mode;
-      const modelHint = mode === "remote" ? cfg.embedding.model : "local-cli";
+
+    /** 解析配置后立即启动 embedding 构建/加载（不 await），与同步 registerGatewayMethod/registerHttpRoute 并行 */
+    const embeddingBackendPromise: Promise<EmbeddingBackend> | null = cfg.embedding
+      ? createEmbeddingBackend(cfg.embedding)
+      : null;
+    if (embeddingBackendPromise) {
       api.logger.info(
-        `openclaw-memory-alibaba-local: registered (db: ${resolvedDbPath}, table: ${LANCEDB_TABLE_NAME}, embedMode: ${mode}, model: ${modelHint})`,
-      );
-    } else {
-      api.logger.info(
-        "openclaw-memory-alibaba-local: registered without embedding (recall/store tools no-op; admin UI can still open LanceDB)",
+        "openclaw-memory-alibaba-local: embedding backend load started (async; local node-llama-cpp may compile native code)",
       );
     }
 
-    const getDbAndBackend = (): { db: MemoryDB; backend: EmbeddingBackend } | null =>
-      backend ? { db, backend } : null;
-
-    const memoryAdminOpts = backend
-      ? {
-          encodeForStorage: (text: string) => backend!.encodeForStorage(text),
-          vectorDim: db.getEmbeddingVectorDim(),
-        }
-      : {
-          vectorDim: db.getEmbeddingVectorDim(),
-        };
+    /** embedding 编译完成前即注册 memory.admin.*，请求在此 await，避免 unknown method */
+    const adminOpsHolder: { ctx: MemoryAdminOpsContext | null } = { ctx: null };
+    let releaseAdminOpsWait!: () => void;
+    const adminOpsWait = new Promise<void>((resolve) => {
+      releaseAdminOpsWait = resolve;
+    });
+    const getMemoryAdminOpsContext = async (): Promise<MemoryAdminOpsContext> => {
+      await adminOpsWait;
+      const c = adminOpsHolder.ctx;
+      if (!c) {
+        throw new Error("openclaw-memory-alibaba-local: plugin failed to initialize (no admin context)");
+      }
+      return c;
+    };
 
     if (typeof api.registerGatewayMethod === "function") {
-      registerMemoryAdminGatewayMethods(api.registerGatewayMethod.bind(api), db, cfg, api.logger, memoryAdminOpts);
+      registerMemoryAdminGatewayMethods(
+        api.registerGatewayMethod.bind(api),
+        getMemoryAdminOpsContext,
+        api.logger,
+      );
     } else {
-      api.logger.warn("openclaw-memory-alibaba-local: registerGatewayMethod missing — memory admin data API disabled");
+      api.logger.warn(
+        "openclaw-memory-alibaba-local: registerGatewayMethod missing — memory admin WS RPC disabled",
+      );
     }
 
     if (typeof api.registerHttpRoute === "function") {
-      registerMemoryPanelRoutes(api.registerHttpRoute.bind(api), db, cfg, api.logger, memoryAdminOpts);
+      registerMemoryPanelRoutes(api.registerHttpRoute.bind(api), getMemoryAdminOpsContext, api.logger);
     } else {
-      api.logger.warn("openclaw-memory-alibaba-local: registerHttpRoute missing — /plugins/memory HTML shell disabled");
+      api.logger.warn(
+        "openclaw-memory-alibaba-local: registerHttpRoute missing — /plugins/memory HTML shell disabled",
+      );
     }
 
-    // --- Tools: memory_recall, memory_store, memory_forget ---
+    // OpenClaw 调用 register(api) 时不会 await；若本函数为 async，首行 await 会导致后续
+    // registerHttpRoute / registerTool / api.on 永远不执行（网关日志会有 async registration ignored）。
+    void (async () => {
+      try {
+      let backend: EmbeddingBackend | null = null;
+      let db: MemoryDB;
+      try {
+        if (cfg.embedding && embeddingBackendPromise) {
+          backend = await embeddingBackendPromise;
+          db = new MemoryDB(resolvedDbPath, backend.vectorDim);
+          const mode = cfg.embedding.mode;
+          const modelHint =
+            mode === "remote"
+              ? cfg.embedding.model
+              : (cfg.embedding.modelPath?.trim() || "~/.openclaw/embedding_model/embeddinggemma-300M-Q8_0.gguf");
+          api.logger.info(
+            `openclaw-memory-alibaba-local: registered (db: ${resolvedDbPath}, table: ${LANCEDB_TABLE_NAME}, embedMode: ${mode}, model: ${modelHint}, vectorDim: ${backend.vectorDim})`,
+          );
+        } else {
+          db = new MemoryDB(resolvedDbPath, 768);
+          api.logger.info(
+            "openclaw-memory-alibaba-local: registered without embedding (recall/store tools no-op; admin UI can still open LanceDB)",
+          );
+        }
 
-    api.registerTool(
+        const getDbAndBackend = (): { db: MemoryDB; backend: EmbeddingBackend } | null =>
+          backend ? { db, backend } : null;
+
+        const memoryAdminOpts = backend
+          ? {
+              encodeForStorage: (text: string) => backend!.encodeForStorage(text),
+              vectorDim: db.getEmbeddingVectorDim(),
+            }
+          : {
+              vectorDim: db.getEmbeddingVectorDim(),
+            };
+
+        adminOpsHolder.ctx = { db, cfg, opts: memoryAdminOpts };
+
+        // --- Tools: only when autoRecall (same switch as before_prompt_build recall) ---
+
+        if (cfg.autoRecall) {
+          api.registerTool(
       (ctx) => ({
         name: "memory_recall",
         label: "Memory Recall",
@@ -1294,11 +1401,19 @@ const memoryPlugin = {
           const capped = Math.max(1, Math.min(RECALL_VECTOR_MAX, limit));
           const limitUser = capped;
           const limitSelf = cfg.enableSelfImprovingMemory ? capped : 0;
-          const results = await runHybridRecall(db, cfg, agentId, query, queryVectors, {
-            limitUser,
-            limitSelf,
-            minScore: RECALL_MIN_SCORE_RELAXED,
-          });
+          const results = await runHybridRecall(
+            db,
+            cfg,
+            agentId,
+            query,
+            queryVectors,
+            {
+              limitUser,
+              limitSelf,
+              minScore: RECALL_MIN_SCORE_RELAXED,
+            },
+            api.logger,
+          );
 
           if (results.length === 0) {
             return {
@@ -1405,7 +1520,11 @@ const memoryPlugin = {
           const storageKey = resolveStorageSessionKey(ctx);
           const sessionId = storageKey || null;
           const item: CaptureCandidate = { category, text, importance };
-          const { action, entry } = await storeOneCaptureItem(agentId, item, cfg, db, backend, { userId, sessionId });
+          const { action, entry } = await storeOneCaptureItem(agentId, item, cfg, db, backend, {
+            userId,
+            sessionId,
+            log: api.logger,
+          });
           const preview = text.length > 100 ? text.slice(0, 100) + "..." : text;
           return {
             content: [{ type: "text", text: `${action === "updated" ? "Updated" : "Stored"}: "${preview}"` }],
@@ -1514,6 +1633,11 @@ const memoryPlugin = {
       }),
       { name: "memory_forget" },
     );
+    } else {
+      api.logger.info(
+        "openclaw-memory-alibaba-local: autoRecall is false — memory_recall / memory_store / memory_forget tools not registered",
+      );
+    }
 
     // --- Hooks: before_prompt_build (recall), agent_end (auto-capture) ---
 
@@ -1545,11 +1669,19 @@ const memoryPlugin = {
           const queryVectors = await embedQueryVectors(backend, extracted.query);
           const embedMs = Date.now() - tEmb0;
           const tSearch0 = Date.now();
-          const results = await runHybridRecall(db, cfg, agentId, extracted.query, queryVectors, {
-            limitUser: RECALL_LIMIT_USER_BEFORE_START,
-            limitSelf: cfg.enableSelfImprovingMemory ? RECALL_LIMIT_SELF : 0,
-            minScore: RECALL_MIN_SCORE_HOOK,
-          });
+          const results = await runHybridRecall(
+            db,
+            cfg,
+            agentId,
+            extracted.query,
+            queryVectors,
+            {
+              limitUser: RECALL_LIMIT_USER_BEFORE_START,
+              limitSelf: cfg.enableSelfImprovingMemory ? RECALL_LIMIT_SELF : 0,
+              minScore: RECALL_MIN_SCORE_HOOK,
+            },
+            api.logger,
+          );
           const searchMs = Date.now() - tSearch0;
           const totalMs = Date.now() - tRecall0;
           api.logger.info(
@@ -1617,22 +1749,55 @@ const memoryPlugin = {
       });
     }
 
-    api.registerService({
-      id: "openclaw-memory-alibaba-local",
-      start: () => {
-        if (cfg.embedding) {
-          const em = cfg.embedding;
-          api.logger.info(
-            `openclaw-memory-alibaba-local: started (db: ${resolvedDbPath}, embedMode: ${em.mode}${em.mode === "remote" ? `, model: ${em.model}` : ""})`,
+        api.registerService({
+          id: "openclaw-memory-alibaba-local",
+          start: () => {
+            if (cfg.embedding) {
+              const em = cfg.embedding;
+              api.logger.info(
+                `openclaw-memory-alibaba-local: started (db: ${resolvedDbPath}, embedMode: ${em.mode}${em.mode === "remote" ? `, model: ${em.model}` : ""})`,
+              );
+            } else {
+              api.logger.info("openclaw-memory-alibaba-local: started (memory not configured)");
+            }
+          },
+          stop: async () => {
+            if (db) await db.close();
+            api.logger.info("openclaw-memory-alibaba-local: stopped");
+          },
+        });
+      } catch (err) {
+        api.logger.error(`openclaw-memory-alibaba-local: failed to initialize: ${String(err)}`);
+        const dimRaw = cfg.embedding ? embeddingVectorDim(cfg.embedding) : 0;
+        const fallbackDim = dimRaw > 0 ? dimRaw : 768;
+        try {
+          const dbDegraded = new MemoryDB(resolvedDbPath, fallbackDim);
+          const adminOptsDegraded = { vectorDim: dbDegraded.getEmbeddingVectorDim() };
+          adminOpsHolder.ctx = { db: dbDegraded, cfg, opts: adminOptsDegraded };
+          api.registerService({
+            id: "openclaw-memory-alibaba-local",
+            start: () => {
+              api.logger.warn(
+                "openclaw-memory-alibaba-local: running in degraded mode (embedding failed; admin UI only)",
+              );
+            },
+            stop: async () => {
+              await dbDegraded.close();
+              api.logger.info("openclaw-memory-alibaba-local: stopped");
+            },
+          });
+          api.logger.warn(
+            `openclaw-memory-alibaba-local: /plugins/memory registered in degraded mode (vectorDim=${fallbackDim}); fix local embedding or switch to embedding.mode=remote`,
           );
-        } else {
-          api.logger.info("openclaw-memory-alibaba-local: started (memory not configured)");
+        } catch (err2) {
+          api.logger.error(`openclaw-memory-alibaba-local: degraded admin registration failed: ${String(err2)}`);
         }
-      },
-      stop: async () => {
-        if (db) await db.close();
-        api.logger.info("openclaw-memory-alibaba-local: stopped");
-      },
+      }
+      } finally {
+        releaseAdminOpsWait();
+      }
+    })().catch((err) => {
+      api.logger.error(`openclaw-memory-alibaba-local: unexpected init failure: ${String(err)}`);
     });
   },
 };

@@ -21,10 +21,11 @@ export type EmbeddingConfigRemote = {
   maxToken: number;
 };
 
-/** Local `llama-embedding` (stdin) or compatible CLI; defaults: commandPrefix, dimensions 768, maxToken 2048. */
+/** Local embeddings via `node-llama-cpp` (GGUF); defaults: model under ~/.openclaw/embedding_model/, maxToken 2048. */
 export type EmbeddingConfigLocal = {
   mode: "local";
-  commandPrefix?: string;
+  /** Absolute path to embedding GGUF. Default: ~/.openclaw/embedding_model/embeddinggemma-300M-Q8_0.gguf */
+  modelPath?: string;
   dimensions?: number;
   maxToken?: number;
 };
@@ -232,7 +233,13 @@ export function vectorDimsForModel(model: string, explicit?: number): number {
 }
 
 export function embeddingVectorDim(cfg: EmbeddingConfig): number {
-  return cfg.mode === "remote" ? cfg.dimensions : (cfg.dimensions ?? 768);
+  if (cfg.mode === "remote") {
+    return cfg.dimensions;
+  }
+  if (typeof cfg.dimensions === "number" && Number.isFinite(cfg.dimensions) && cfg.dimensions > 0) {
+    return cfg.dimensions;
+  }
+  return 0;
 }
 
 export function modelSupportsFlexDimensions(model: string): boolean {
@@ -313,10 +320,10 @@ function parseEmbeddingConfig(raw: unknown): EmbeddingConfig {
       maxToken,
     };
   }
-  assertAllowedKeys(e, ["mode", "commandPrefix", "dimensions", "maxToken"], "embedding");
+  assertAllowedKeys(e, ["mode", "modelPath", "dimensions", "maxToken"], "embedding");
   return {
     mode: "local",
-    commandPrefix: typeof e.commandPrefix === "string" && e.commandPrefix.trim() ? e.commandPrefix.trim() : undefined,
+    modelPath: typeof e.modelPath === "string" && e.modelPath.trim() ? e.modelPath.trim() : undefined,
     dimensions: typeof e.dimensions === "number" && Number.isFinite(e.dimensions) ? e.dimensions : undefined,
     maxToken: typeof e.maxToken === "number" && Number.isFinite(e.maxToken) ? e.maxToken : undefined,
   };
@@ -558,7 +565,7 @@ export const memoryConfigSchema = {
       enableFullContextMemory,
       enableSelfImprovingMemory,
       memoryExtractionMethod,
-      autoRecall: cfg.autoRecall !== false,
+      autoRecall: cfg.autoRecall === true,
       autoCapture: cfg.autoCapture !== false,
       captureMaxChars: captureMaxChars ?? DEFAULT_CAPTURE_MAX_CHARS,
       enableMemoryDecay,

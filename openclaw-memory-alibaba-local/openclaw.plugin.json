@@ -2,6 +2,7 @@
   "id": "openclaw-memory-alibaba-local",
   "name": "openclaw-memory-alibaba-local",
   "description": "Local LanceDB long-term memory; user_memory_*, self_improving_*; DashScope-friendly defaults; table openclaw_memories_alibaba_local.",
+  "kind": "rds_memory",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -14,15 +15,15 @@
       "embedding": {
         "type": "object",
         "additionalProperties": false,
-        "description": "Omitted or {} → local llama-embedding. If apiKey/model/baseUrl/dimensions set without mode → remote (maxToken/dimensions default in plugin parse).",
+        "description": "Omitted or {} → local node-llama-cpp (GGUF). If apiKey/model/baseUrl set without mode → remote.",
         "properties": {
           "mode": { "type": "string", "enum": ["local", "remote"], "default": "local" },
-          "commandPrefix": {
+          "modelPath": {
             "type": "string",
-            "description": "Shell command; stdin = text to embed. Default uses llama-embedding +  --embd-output-format json."
+            "description": "Absolute path to embedding GGUF (supports ~). Default: ~/.openclaw/embedding_model/embeddinggemma-300M-Q8_0.gguf"
           },
-          "dimensions": { "type": "number", "description": "768 default (local); 1024 default (remote) when omitted." },
-          "maxToken": { "type": "number", "description": "2048 default (remote) when omitted." },
+          "dimensions": { "type": "number", "description": "Optional; local: inferred from GGUF if omitted. Remote: defaults to 1024 when omitted in parse." },
+          "maxToken": { "type": "number", "description": "Chunk budget (char/4 approx); default 2048 local and remote when omitted in parse." },
           "apiKey": { "type": "string" },
           "model": { "type": "string" },
           "baseUrl": { "type": "string" }
@@ -61,7 +62,7 @@
         "default": "llm",
         "description": "regex or llm; llm needs apiKey+model (plugin llm and/or openclaw.json bailian + agents.defaults.model)."
       },
-      "autoRecall": { "type": "boolean", "default": true },
+      "autoRecall": { "type": "boolean", "default": false },
       "autoCapture": { "type": "boolean", "default": true },
       "captureMaxChars": { "type": "number", "default": 50000 },
       "enableMemoryDecay": {
@@ -132,12 +133,12 @@
     },
     "embedding.mode": {
       "label": "Embedding mode",
-      "help": "local: llama-embedding (stdin). remote: OpenAI-compatible HTTP (all remote fields required; first embed may fail if invalid)."
+      "help": "local: node-llama-cpp (GGUF, CPU). remote: OpenAI-compatible HTTP."
     },
-    "embedding.commandPrefix": {
-      "label": "Local embed command",
-      "placeholder": "llama-embedding -m ~/.openclaw/... --embd-output-format json",
-      "help": "Must read prompt from stdin; JSON output recommended for parsing."
+    "embedding.modelPath": {
+      "label": "Local GGUF path",
+      "placeholder": "/root/.openclaw/embedding_model/embeddinggemma-300M-Q8_0.gguf",
+      "help": "Absolute path; ~ allowed. Omit for default under ~/.openclaw/embedding_model/"
     },
     "embedding.apiKey": {
       "label": "Embedding API Key (remote)",
@@ -205,7 +206,7 @@
     },
     "autoRecall": {
       "label": "Auto Recall",
-      "help": "Inject memories at conversation start"
+      "help": "When true: inject memories before each prompt and register memory_recall / memory_store / memory_forget. When false (default): no auto recall and no those tools; agent_end capture still follows autoCapture."
     },
     "autoCapture": {
       "label": "Auto Capture",

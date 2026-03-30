@@ -139,8 +139,9 @@ export async function opMemoryAdminFacets(ctx: MemoryAdminOpsContext): Promise<A
   try {
     const facets = await ctx.db.listAdminFacets([], undefined, undefined);
     return { ok: true, data: facets };
-  } catch (e) {
-    return { ok: false, status: 400, body: { error: String(e) } };
+  } catch {
+    // 无数据或 LanceDB 边缘情况：与空表一致，返回空下拉而非 400
+    return { ok: true, data: { agents: [], sessions: [] } };
   }
 }
 
